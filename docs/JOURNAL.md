@@ -1336,3 +1336,72 @@ normalization at generation time). The 50k-row smoke test gives a realistic even
 ---
 *(Next entry: P3.2 — widen the CDT to ~10 M params, wire our arrays through TRADES'
 DataModule, and train on Kaggle free tier; then P3.3 stylized-fact validation.)*
+
+### P3.2 bring-up — Kaggle debugging log (2026-06-28)
+
+Getting TRADES to *start* training on a Kaggle free GPU took six distinct fixes. None were
+about the model or the math — all were environment/integration friction, the unglamorous
+80% of making research code run somewhere it wasn't written for. Logged because each carries
+a transferable lesson, and because "it finally trained" hides what it taught.
+
+**1. Scary-looking pip conflicts that were pure noise.** Installing DeepMarket's
+`requirements.txt` printed a wall of red `ERROR: pip's dependency resolver…` lines —
+`cudf`, `cuml`, `dask-cuda` wanting different `numba`/`numba-cuda` versions. Alarming, and
+irrelevant: those are Kaggle's pre-installed RAPIDS GPU-dataframe libraries, none of which
+TRADES imports. *Lesson:* read *which* packages conflict before reacting. A resolver
+complaint about libraries you never import is noise; the only conflicts that matter are ones
+on your actual import path (`torch`, `lightning`).
+
+**2. `FileNotFoundError: data/INTC/train.npy` — the relative-path trap.** Our driver copied
+the arrays to `DeepMarket/data/INTC/`, but DeepMarket's `run.py` loads them via the
+*relative* path `data/INTC/train.npy`, and we launched the script from the `hft-simlab`
+working directory — so the path resolved against the wrong root. *Fix:* `os.chdir(deepmarket)`
+inside the driver after staging data. *Lesson:* a tool that uses relative paths defines an
+implicit contract about its working directory; honour it explicitly rather than assuming the
+launcher's cwd.
+
+**3. `AttributeError: 'Configuration' object has no attribute 'FILENAME_CKPT'`.** Our pre-run
+param-count probe instantiated `DiffusionEngine(config)` directly, but that constructor reads
+`config.FILENAME_CKPT`, which `run()` only sets *later* in its own setup. *Fix:* set a
+placeholder `config.FILENAME_CKPT` before the probe. *Lesson:* when you replicate a fraction
+of a framework's setup to peek at something early (here, parameter count), you inherit its
+hidden initialization order — either replicate it fully or guard the peek (we did both: set
+the attribute *and* wrap the probe in try/except so a failed count never blocks training).
+
+**4. The DDP ambush — `can't open file '…/DeepMarket/experiments/kaggle/p32_train_trades.py'`.**
+The real blocker. Kaggle's accelerator is **T4 ×2**, and PyTorch-Lightning, seeing two GPUs,
+silently defaulted to **distributed (DDP)** training. DDP works by *re-launching the training
+script as subprocesses* — but it computed the script path relative to our `chdir`-ed cwd
+(`DeepMarket/`), where the script doesn't live (it's in `hft-simlab/`), so every child died
+with code 2. Two latent decisions collided: "use all visible GPUs" and "we chdir'd
+elsewhere." *Fix:* `os.environ["CUDA_VISIBLE_DEVICES"] = "0"` before importing torch — one
+visible GPU, no DDP, no subprocess relaunch. *Lesson:* multi-GPU is a *default*, not a
+request; for a ~10M model on free tier it buys nothing and adds a whole failure surface.
+Pin the device count unless you deliberately want distributed.
+
+**5. Widening the wrong knob — 34 M params at depth 1.** I had assumed model size scales with
+transformer *depth*, so I "widened" via `augment_dim 64 → 128`. The smoke test (forced to
+depth 1) printed **34.43 M parameters** — already over the 5–15 M budget with *one* layer.
+The augmenter/embedding cost scales ≈ `augment_dim²` and dominates; depth was nearly free.
+At `augment_dim=64, depth=8` the model is **9.99 M** — in budget. *Lesson:* never reason about
+parameter counts from architecture intuition — *measure*. We added a `--count-only` flag so
+the count prints in seconds without training; that one number redirected the whole sizing.
+
+**6. The silent sweep — debugging blind by grep.** A first `--count-only` sweep over
+`augment_dim ∈ {64,48,32}` printed only the `=== augment_dim=N ===` headers and *no* counts.
+The cause was twofold: the Kaggle dataset mounts at
+`/kaggle/input/datasets/<user>/hft-p31`, not the `/kaggle/input/hft-p31` I'd guessed, so the
+driver `sys.exit`-ed on missing data — *and* we had piped the command through
+`grep "parameters|warn"`, which hid the very error message that said so. *Lesson (two):*
+(a) verify the actual mount path of a cloud dataset, don't assume the slug; (b) **never
+filter output while debugging** — `grep` turns a loud, informative failure into a silent one.
+Run raw first, filter only once you know what you're looking at.
+
+The throughline: every bug was an *interface mismatch* — between our launcher and DeepMarket's
+cwd assumptions, between our probe and its init order, between Lightning's defaults and the
+hardware, between our path guess and Kaggle's mount layout. Research code that runs on the
+author's machine encodes a hundred such assumptions; porting it is the work of finding them.
+
+---
+*(Next entry: P3.2 results — training curves + the first generated sample; then P3.3
+stylized-fact validation suite.)*
