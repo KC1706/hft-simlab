@@ -1,0 +1,1060 @@
+# HFT-SimLab Learning Journal
+
+Every major change gets an entry: **what was done → theory behind it → which paper/book and
+how exactly it was used**. Written for revision — read top to bottom and you re-learn the
+project's whole intellectual arc.
+
+---
+
+## Entry 0 — Project setup, reference repos, and the foundations (2026-06-10)
+
+### What was done
+- Created the project skeleton (`hft-simlab/` with `refs/`, `docs/`, `data/`).
+- Shallow-cloned 5 reference repos into `refs/` (~190 MB): hftbacktest, DeepMarket (TRADES),
+  ABIDES, LOBCAST, liquibook. These are read-only — we copy patterns/code *out* of them.
+- Verified toolchain: git, Python 3.14, uv, Xcode CLT present; Rust to be installed in P0.1.
+- Wrote `PLAN.md` (the end-to-end plan) and `CLAUDE.md` (the working protocol).
+
+### Theory 0.1 — What a limit order book (LOB) actually is
+
+Modern exchanges are **continuous double auctions**. Anyone can post a *limit order*
+("buy 2 BTC at ≤ $60,000") which rests in the book, or a *market order* ("buy 2 BTC now")
+which consumes resting orders. The book is just two priority queues:
+- **Bids** (buy orders), best = highest price.
+- **Asks** (sell orders), best = lowest price.
+- **Spread** = best ask − best bid. **Mid** = their average.
+
+Matching follows **price-time priority (FIFO)**: better-priced orders fill first; among equal
+prices, *earlier* orders fill first. That second clause is the seed of half this project:
+**where you stand in the queue at a price level determines whether you get filled at all, and
+which fills you get.**
+→ Book reference: Harris, *Trading and Exchanges* — Part II (market structures); the cleanest
+mechanical description in print.
+
+### Theory 0.2 — Market data feeds: MBP vs MBO
+
+Exchanges publish the book in two granularities:
+- **L2 / Market-by-Price (MBP):** aggregate volume per price level ("$60,000 bid: 14.2 BTC
+  total"). You see the level, not the orders inside it. This is what Binance/Bybit websockets
+  give the public.
+- **L3 / Market-by-Order (MBO):** every individual order add/cancel/execute with order IDs
+  (NASDAQ ITCH, LOBSTER data). You can reconstruct exact queues.
+
+Crypto's public feeds are L2 — so queue position must be *modeled*, not observed. That's why
+hftbacktest has "probability queue models" and why our Phase 2.2 exists. In `refs/hftbacktest`,
+the relevant code is `hftbacktest/src/backtest/models/queue.rs` (queue models) and
+`data/reader.rs` (feed reconstruction).
+→ Book reference: Hasbrouck, *Empirical Market Microstructure* — ch. 1–2 frame what's
+observable vs latent in market data.
+
+### Theory 0.3 — Why naive backtests lie (the project's reason to exist)
+
+Four mechanical lies, in increasing subtlety:
+1. **Fill lie:** naive backtester fills your limit order when price *touches* it. Reality:
+   you're behind a queue; price often touches and retreats, filling only people ahead of you.
+   Worse — **adverse selection**: the fills you *do* get cluster in moments when price is about
+   to move against you (informed flow just ran over your level). So naive backtests overstate
+   both fill *rate* and fill *quality*.
+2. **Latency lie:** the backtest acts on the same book state that generated the signal. Reality:
+   your order arrives 0.1–50 ms later into a *different* book — and during races, after faster
+   players already reacted to the same trigger.
+3. **Impact lie:** historical replay is a recorded movie; your simulated trades don't move
+   prices. Reality: trading pressure shifts prices against you (concave, ~square-root in size),
+   then partially reverts after you stop.
+4. **Feedback lie:** other participants would have *reacted* to your orders (quotes pulled,
+   spreads adjusted). Replay can't know this; only a generative/agent-based market can fake it.
+
+Phases 2.2–2.4 and 3 attack lies 1–4 respectively. The ablation study (Phase 4) measures the
+cost of each lie in PnL-prediction error — the number nobody has published.
+→ Bouchaud, *Trades, Quotes and Prices*: impact and order-flow chapters are the theory
+spine for lies 3–4 (propagator model, square-root law, flow long-memory).
+
+### Theory 0.4 — Why each reference repo was chosen
+
+- **hftbacktest** (Rust): the only open backtester that already models queues + latency on full
+  tick data. We extend rather than reinvent; our novelty = *calibrated* models + impact
+  feedback + the ablation harness. Extension points found today: `models/queue.rs`,
+  `models/latency.rs`, exchange processors in `proc/`.
+- **DeepMarket/TRADES**: official code of the diffusion-transformer LOB generator
+  (arXiv 2502.07071) — Phase 3 starts from here, retargeted to our crypto data.
+- **ABIDES** (JPMorgan): the academic-standard agent-based exchange; its Gym wrapper is our
+  Phase 4 RL pattern; also TRADES's own simulation host, so compatibility is proven.
+- **LOBCAST**: benchmark suite of LOB deep-learning predictors — baseline zoo + preprocessing
+  conventions.
+- **liquibook** (C++): clean matching-engine architecture to study before writing our own
+  minimal book in Phase 1 (header-only, easy to read in one sitting).
+
+### Papers anchoring the project (read order for you)
+1. arXiv 2603.24137 *Bridging the Reality Gap in LOB Simulation* — read first; it is the
+   project's blueprint (project → estimate → validate → adapt).
+2. arXiv 2403.02572 *Fill Probabilities in a LOB* — the estimation machinery for Phase 2.2.
+3. Moallemi & Yuan *Queue Position Valuation* — the economics of queue position.
+4. arXiv 2601.23172 *Unified theory of order flow, impact, volatility* — the consistency
+   checks for Phase 2.4.
+5. arXiv 2502.07071 *TRADES* — Phase 3 architecture (code in `refs/DeepMarket`).
+6. (Already on disk) TradeFM 2602.23784 — tokenization ideas for Phase 3.
+
+### Open questions carried forward
+- Which second symbol alongside BTCUSDT? Want contrast in tick regime (large-tick vs
+  small-tick behaviour differs sharply — Reality Gap paper is about large-tick assets).
+  Decide in P0.2 after looking at spread/tick ratios.
+
+---
+
+## Entry 1 — Phase 0 complete: toolchain, real tick data, first backtest (2026-06-10)
+
+### What was done
+- Installed Rust 1.94 (`rustup`) and a Python 3.12 venv (`uv`) with hftbacktest 2.4.4.
+- Downloaded the **free** Tardis.dev first-of-month datasets for Binance Futures BTCUSDT,
+  2026-05-01: `trades` (25 MB gz, 3.17M rows) and `incremental_book_L2` (532 MB gz, **101M rows**).
+  Gotcha found: `datasets.tardis.dev` returns 404 to HEAD requests — only GET works.
+- Sliced to the first ~7 hours (25M book rows), converted to hftbacktest's `.npz` event format
+  (`scripts/p0_convert.py`), ran a naive market-making backtest (`scripts/p0_backtest.py`),
+  and produced `experiments/p0_baseline_equity.png`. Then deleted raw slices (disk budget).
+
+### Theory 1.1 — Anatomy of the data you just bought for $0
+Tardis records the **raw exchange feed**: every L2 delta ("price level 60000.1 bid now has
+14.2 BTC") plus every trade print, each with two timestamps — `timestamp` (exchange's) and
+`local_timestamp` (Tardis's receive time). The difference is *feed latency*: the first
+ingredient of Phase 2.3. Subtlety from the converter source (`tardis.py:67`): Binance Futures
+publishes the 'E' (send) time, not 'T' (match) time, so measured latency slightly understates
+reality — we log this as a known bias for the paper's limitations section.
+
+### Theory 1.2 — Why trades must be converted BEFORE depth updates
+A trade does two things at once: it prints (someone got filled) and it removes volume from a
+book level. The exchange then also sends a depth delta reflecting that removal. If the
+backtester processed the depth delta first and the trade second, a simulated order's queue
+position would be decremented **twice** for one real event — silently inflating your fill
+rate. hftbacktest's converter therefore demands `[trades, depth]` input order
+(`tardis.py:75-80`). This is exactly the kind of mechanical detail that separates honest
+backtests from fantasy — lie #1 of Entry 0 hides in details this small.
+
+### Theory 1.3 — The event format and why 101M rows broke our first plan
+Each event becomes a fixed 64-byte record: `(ev_flags u64, exch_ts i64, local_ts i64,
+px f64, qty f64, order_id u64, ival i64, fval f64)`. Fixed-width binary means the backtester
+can memory-map and stream it with zero parsing — that's why one 7-hour backtest (26.7M events)
+runs in about a minute. But 101M rows × 64 B ≈ 6.5 GB *just for the conversion buffer* — more
+than this machine's 8 GB RAM. Lesson: **at HFT data scales you size memory before you run,
+not after it crashes.** We sliced to 25M rows; Phase 1's Rust replay will stream instead,
+removing the limit entirely.
+
+### Theory 1.4 — Reading the first backtest like a microstructurist
+The strategy: quote both sides at mid ± 20 ticks, skew quotes against inventory (the simplest
+form of the Avellaneda-Stoikov/Cartea inventory-control idea — Cartea, *Algorithmic & HFT*,
+ch. 10), post-only orders (GTX = never cross the spread = always pay maker fee, not taker).
+Configuration is deliberately the project's **naive baseline**: constant 10ms latency and
+hftbacktest's `risk_adverse_queue_model` (pessimistic: you're always at the queue's back).
+
+Result: SR ≈ −685, return-over-trade ≈ −3 bps/trade, turnover ~99×/day — a steady bleed.
+Why? **Adverse selection**: passive quotes get filled disproportionately when the market is
+about to move through them (the informed/fast flow hits you, the harmless flow doesn't reach
+you). With naive quoting, the spread you earn < adverse selection cost + fees (Moallemi-Yuan's
+decomposition from PLAN P2.2; Bouchaud TQP's "spread vs impact" balance). A real MM survives
+by better queue position, faster reaction, and smarter skew — precisely the dynamics Phases
+2.2–2.4 will model honestly. **Keep this number: it is the project's first data point — the
+naive-baseline cell of the final ablation table.**
+
+### Paper used today
+- hftbacktest's converter + docs (engineering source of truth). The Reality Gap paper
+  (2603.24137) framed what we logged for later: feed-latency distribution and the E-vs-T
+  timestamp bias both feed §3.3 and Limitations.
+
+### Debugging addendum (2026-06-11) — the blank PNG
+First bug of the project, and a classic: `stats.plot()` internally calls `plt.close()` and
+*returns* the Figure (`refs/.../stats/stats.py:245-247`). Our script ignored the return value
+and called `plt.savefig()`, which saves pyplot's *current* figure — by then a fresh empty one.
+White image. Fix: `fig = stats.plot(); fig.savefig(...)`. Lesson: when a library misbehaves,
+read its source — we have every dependency's source in `refs/` for exactly this reason.
+
+**Reading the fixed plot (do this with the PNG open):** top panel — blue (equity after fees)
+bleeds to −0.9% of book size over 7h; orange (equity *before* fees) also falls (−0.35%), so
+fees are NOT the main problem — the trading itself loses, confirming adverse selection. Note
+the sharp equity drop near 03:00 right where the grey price line falls fast: a fast move ran
+over our resting quotes, filled us into a losing inventory — adverse selection made visible.
+Bottom panel — position pinballs between the ±0.005 caps: the naive skew barely manages
+inventory; it gets pushed to a cap and waits to be run over.
+
+### Manual test for you (P0 gate)
+1. `cd hft-simlab && .venv/bin/python scripts/p0_backtest.py` — should print the stats table
+   and rewrite `experiments/p0_baseline_equity.png`. Open the PNG, look at the equity curve.
+2. Edit `scripts/p0_backtest.py`: change `half_spread = 20.0 * tick` to `60.0 * tick`, rerun.
+   Predict first, then check: fewer fills, lower turnover — does PnL improve or worsen? Why?
+   (Hint: wider quotes = more spread earned per fill but worse queue position and fewer fills;
+   adverse selection changes too.)
+3. Write one sentence in your own words: why did the naive MM lose money? If you can't,
+   re-read Theory 1.4 before we proceed to Phase 1.
+
+---
+## Entry 2 — P1.1: A minimal L2 order book in Rust, from scratch (2026-06-12)
+
+### What was done
+- Created `core/` — our first own Rust crate, `lob-core` (zero dependencies, deliberately):
+  - `src/book.rs` — `L2Book`: applies incremental MBP depth updates, maintains best bid/ask,
+    serves top-N depth arrays, detects locked/crossed updates. 12 unit tests including a
+    100k-update randomized soak that asserts the book can never stay crossed.
+  - `src/events.rs` — `Event` struct + flag constants, **byte-compatible with hftbacktest's
+    `.npz` rows** (64-byte aligned, same field order), so the P1.2 replay harness can mmap
+    the exact BTCUSDT file from Phase 0. Copied from `refs/.../types.rs:150-331` with attribution.
+  - `examples/ladder_demo.rs` — feeds a handcrafted sequence and prints the ladder after each
+    step; step 4 shows a crossing update being detected and resolved live.
+- `cargo test`: 14/14 pass. Demo verified.
+
+### Theory 2.1 — An L2 book is a *mirror*, not a matching engine
+The exchange's matching engine (liquibook in `refs/` is a clean C++ one) holds every order and
+matches by price-time priority. What the public L2 feed broadcasts is only the *aggregate*
+quantity per price level — the shadow the engine casts. So our book does no matching at all:
+it applies **absolute** updates ("level 50000.1 now holds 3.2 BTC" — *not* a delta; qty 0
+means the level vanished) and its only intelligence is keeping the best-price pointers honest.
+Everything inside a level — the queue of individual orders, and our place in it — is invisible
+in L2. Hold that thought: P2.2's entire job is inferring that invisible queue.
+→ Harris, *Trading & Exchanges*, ch. 4 (order types) and the order-driven-markets chapter
+(precedence rules); Bouchaud *TQP*, the limit-order-book chapter of Part II, for the book as
+the central data structure of modern markets.
+
+### Theory 2.2 — Integer ticks, or: never use a float as a price key
+Prices live on a grid: BTCUSDT-perp's tick size is 0.1. But f64 cannot represent 0.1 exactly,
+and `50000.1 / 0.1 = 500000.999…` — truncate that and your level lands one tick off; use the
+float itself as a map key and "the same price" from two code paths may be two different keys.
+So the book keys on `round(px / tick_size) as i64` and only converts back for display (the
+test suite asserts ticks with `==` but prices only approximately — `500001 × 0.1 ≠ 50000.1`
+in f64, ~381 ulps off!). Same convention as hftbacktest (`hashmapmarketdepth.rs:92`).
+Conceptual bonus: tick size is economics, not plumbing — a **large-tick** asset (spread pinned
+at 1 tick, fat queues, queue position is everything) trades differently from a **small-tick**
+one (thin levels, spread breathes). BTCUSDT-perp at 0.1 ticks on a ~$100k price is *small-tick*;
+our P0 spread distribution will confirm it. Bouchaud *TQP* discusses the large/small-tick
+dichotomy early in the LOB part — worth reading now; it decides how much P2.2's queue model
+will matter per symbol (a planned contrast in the ablation).
+
+### Theory 2.3 — Locked and crossed books: feed artifacts with information in them
+A **locked** book has bid == ask (spread 0); a **crossed** book has bid > ask. A matching
+engine can't rest in either state — it would just match. But an L2 *feed consumer* sees them
+transiently: diff batches arrive with one side updated before the other, or a stale level
+lingers after the venue moved. (In US equities locked/crossed markets are a *regulatory*
+concept across venues — Reg NMS; here, single-venue, they are pure feed-staleness artifacts.)
+Two design options when an update crosses the standing book:
+1. **Hard-resolve:** delete the opposite-side levels the update crossed (assume they're gone).
+2. **Trust-the-feed (hftbacktest's choice, and ours):** move the best pointer past the stale
+   levels but *keep their entries* — the feed will refresh them shortly. Their doc comment
+   (`hashmapmarketdepth.rs:10-20`) explains why: with missing feed messages, aggressive
+   deletion makes errors permanent, pointer-skipping lets the book self-heal.
+We replicate option 2 *exactly* — including which side's pointer moves and the strict
+inequality bounds of the rescan (`depth_above(start+1..)`, `depth_below(..start)`) — because
+P1.2's manual test is a level-for-level match against hftbacktest's reconstruction. We add
+what they don't have: `locked_updates`/`crossed_updates` counters. Those are data-quality
+telemetry — a day with thousands of crossings means a degraded feed, which would silently
+poison every Phase 2 calibration. Cheap insurance, one branch each.
+
+### Theory 2.4 — BTreeMap vs HashMap: our one deliberate divergence
+hftbacktest stores each side as `HashMap<tick, qty>` + cached best pointers + low/high
+watermarks, and rescans tick-by-tick when the best is deleted — O(1) updates, but the rescan
+walks *every* tick in the gap, and ordered iteration (top-N) isn't free. We store
+`BTreeMap<tick, qty>`: O(log n) updates, but next-best is one `range()` call over *existing*
+levels and top-5 depth arrays fall out of ordered iteration — which P1.3's measurement
+notebook needs constantly. Same observable semantics, different engine. P1.2 will benchmark
+both honestly on 100M real events; expect the HashMap to win raw event throughput and the
+BTreeMap to win when every event also reads depth arrays. That benchmark becomes the
+portfolio writeup.
+
+### Found while reading the refs (keep doing this)
+hftbacktest's `clear_depth` recomputes the post-clear best bid via `depth_below(clear_upto-1,…)`
+(`hashmapmarketdepth.rs:208-209`), whose scan is *strictly below* its start — so a level at
+exactly `clear_upto − 1` gets skipped. Harmless in practice (a full snapshot always follows a
+clear and rebuilds the pointers), but it's an off-by-one we chose not to copy: our
+`clear_side` rescans actual map keys. Lesson: read reference code critically, even good
+reference code — and note where you diverge and why, because parity tests will find the
+difference before you remember it.
+
+### Paper used today
+None — PLAN.md's paper map assigns no research paper to P1.1; this step's sources are
+engineering: `refs/hftbacktest/.../hashmapmarketdepth.rs` + `types.rs` (semantics we mirror,
+with attribution in our doc comments) and a structural glance at liquibook's `depth.h`
+(aggregate-by-price levels for display — same mirror idea in C++). The Reality Gap recipe
+(arXiv 2603.24137) resumes duty in Phase 2.
+
+### Manual test for you (P1.1 gate)
+1. `cd hft-simlab/core && cargo test` — expect 14/14 green. Skim the test *names*: they are
+   the book's spec in one screen.
+2. `cargo run --example ladder_demo` — read all 5 steps against Theory 2.1–2.3: step 2 is
+   absolute-vs-delta semantics, step 3 best-price promotion, step 4 a crossing update
+   (watch `crossed: 1` appear while the displayed ladder stays uncrossed), step 5 the feed
+   refreshing the stale level away.
+3. Predict-then-verify: in `examples/ladder_demo.rs`, change step 4's price `50_000.3` to
+   `50_000.9` (crossing past *every* ask). Predict the ladder first — what is the best ask
+   after the update? Then run it. (Answer shape: pointer skips past all asks → ask side
+   displays empty/one-sided, all three stale entries retained internally, `state: BidOnly`.)
+4. Say in one sentence why the book keeps stale crossed levels instead of deleting them —
+   if stuck, re-read Theory 2.3.
+
+## Entry 3 — P1.2: Replay harness, parity test, and the benchmark (2026-06-13)
+
+*(Autopilot note: from this entry on, the user has enabled autopilot — I run the manual
+tests myself and report results; the exercises at the end remain for the user's review.)*
+
+### What was done
+- `core/src/npz.rs` — streaming `.npz` reader: hand-parsed zip container (End-Of-Central-
+  Directory trailer → central directory → local header → raw deflate stream via `flate2`,
+  our single new dependency) + hand-parsed npy header with a strict dtype check that fails
+  loudly on any layout drift. Constant memory: the 1.7 GB day never exists in RAM at once.
+- `core/src/bin/replay.rs` — the harness: streams the day, applies LOCAL-flagged events to
+  our `L2Book` (dispatch mirrors `refs/.../proc/local.rs:290+`), validates consistency,
+  measures throughput, and can snapshot the top-N ladder at given timestamps (JSON out).
+- `core/tests/fixtures/tiny.npz` + `tests/replay_npz.rs` — 10-row numpy-written fixture
+  covering clear+snapshot, a trade, and a crossing; tests the container parsing end to end.
+- `scripts/p12_parity.py` — the P1 gate: 3 seeded-random timestamps, our top-5 vs
+  hftbacktest's `HashMapMarketDepth` elapsed to the same instants.
+- `scripts/p12_bench.py` — honest throughput comparison.
+
+### Results (run on the BTCUSDT 2026-05-01 00:00–06:56 file, 26,663,697 events)
+- **Consistency: zero violations.** local_ts and exch_ts both monotone, no negative
+  quantities, book never crossed after any update.
+- **Parity: PASS.** All top-5 levels — integer ticks AND quantities — identical to
+  hftbacktest's reconstruction at all 3 random timestamps (+122.6, +195.3, +287.9 min).
+  The P1.1 decision to mirror their stale-level semantics paid off exactly here.
+- **Telemetry:** 3,809 crossing + 319 locking updates in ~7 h (≈1 per 6,500 events) —
+  normal transient feed staleness, now quantified per day for free.
+- **Throughput:** ours 3.1 s end-to-end ≈ **8.6 M events/s**; hftbacktest ≈ 9.2 M events/s
+  end-to-end (their elapse alone 10.4 M ev/s after a 0.33 s "load" — their reader defers
+  real decompression into the run, overlapping it with processing).
+
+### Theory 3.1 — Containers: what a .npz actually is, and why we stream it
+`.npz` = a zip archive of `.npy` members; `.npy` = magic + version + a Python-dict header
+(dtype, shape, order) + raw little-endian records. Two non-obvious bits: (1) the *trailer*
+(EOCD record) is the authoritative index of a zip — local headers may carry zeroed sizes
+(data-descriptor mode), so robust readers parse from the end; (2) numpy structured dtypes
+map 1:1 onto a `#[repr(C)]` struct as long as field order, widths, and padding agree — our
+`events.rs` layout test is what makes that contract checkable. We stream because the
+machine has 8 GB RAM and the raw array is 1.7 GB and growing with each recorded day;
+decompressing on the fly costs nothing here (see Theory 3.4).
+
+### Theory 3.2 — Two clocks per event, and the bug I hit
+Every event carries `exch_ts` (when the exchange says it happened) and `local_ts` (when our
+collector received it). The *local* book — what a strategy could actually have known — is
+defined by: apply every LOCAL-flagged event with `local_ts ≤ T`. That definition is what
+both sides of the parity test implement, which is why they can agree bit-for-bit.
+Subtlety found in the data: ~955 k rows (3.7%) are EXCH-only duplicates — the converter
+splits an event into exchange-clock and local-clock copies whenever one ordering would
+violate the other, so each processor sees a monotone stream (our validator confirming
+`local_ts_order=0` is the converter's guarantee, verified).
+And the bug: my parity script first assumed a fresh backtest's `current_timestamp` was the
+data start. Empirically it is `i64::MAX` — a sentinel for "unset" — and `elapse()` measures
+from the file's earliest timestamp. The book came back empty, the script said "fewer than
+5 levels", and a 10-line probe script gave the real semantics in one run. Lesson repeated
+from Entry 1's blank PNG: when an API surprises you, *probe it empirically* — print the
+actual values, don't reason from what the API "should" do.
+
+### Theory 3.3 — Trades don't touch the book
+The replay counts trades (710,636) but never applies them to depth. An L2 feed reports the
+book *after* the matching engine already removed the traded volume — the depth delta
+arrives as its own event. Apply both and you double-decrement: this is the same
+double-count Entry 1 flagged for queue positions (trades sorted before their depth deltas),
+now showing up as a book-construction rule. Trades matter for *flow* measurement — which
+is exactly P1.3: they carry the aggressor side (who crossed the spread), the raw material
+of order-flow imbalance and the trade-signature plots.
+→ Bouchaud *TQP*: order flow chapters; Hasbrouck ch. on trades vs quotes data.
+
+### Theory 3.4 — What the benchmark actually taught
+P1.1 predicted "HashMap wins raw throughput, BTreeMap wins when reading depth arrays".
+Reality: both stacks land at ~9 M events/s and the difference is noise, because **per-event
+data-structure cost is drowned by stream decompression and memory traffic**. The real
+lessons: (a) measure before optimizing — the asymptotic argument was real but irrelevant at
+this scale; (b) hftbacktest hides its 1.7 GB decompression *inside* the run via lazy/
+background loading, a systems trick worth remembering; (c) 26.6 M events over 416 min is
+~1,070 events/s *average* but arrives in bursts thousands of times denser — throughput
+headroom (~9 M/s vs ~1 k/s) is what makes Phase-2's per-event model overhead affordable.
+
+### Paper used today
+None new — engineering references: PKWARE APPNOTE (zip format), numpy's NEP-1 (npy format),
+`refs/.../proc/local.rs` (event dispatch parity). The parity methodology itself (validate a
+reimplementation against a reference at randomly sampled states) is standard simulation
+hygiene and goes into §3.1's validation sentence.
+
+### Manual exercises for you (autopilot already ran the gates)
+1. `cd hft-simlab/core && cargo test` (15 tests now) and
+   `./target/release/replay ../data/btcusdt_20260501_0000_0656.npz` — read the report line
+   by line; every number should now mean something to you.
+2. `.venv/bin/python scripts/p12_parity.py` — change `SEED`, rerun: parity must hold at ANY
+   timestamps. If you want to see it fail honestly, flip a `>=` to `>` in
+   `core/src/book.rs`'s crossing branch, rebuild, rerun (then revert!).
+3. Explain to yourself why trades must not be applied to the book (Theory 3.3) — this will
+   be on the "exam" when we build the queue model.
+
+## Entry 4 — P1.3: Measuring the market's fingerprint (2026-06-13)
+
+### What was done
+- `replay --measure <dir>` (Rust): logs two datasets in one streaming pass —
+  `samples.csv`: every 100 ms, top-of-book, top-10 level quantities per side, per-interval
+  **OFI** (Cont–Kukanov–Stoikov), signed trade volume/counts; `trades.csv`: the full tape
+  (ts, aggressor sign, price tick, qty). Still 5.5 M events/s with measurement on.
+- `scripts/p13_measure.py`: CSV → parquet (`experiments/data/p13/`, ~16 MB — also FIG-7's
+  future real-side input). `experiments/figures/p13_stylized_facts.py`: renders **FIG-10**
+  (spec added to FIGURES.md) and writes `stats.json`. Output:
+  `experiments/p13_stylized_facts.png`.
+
+### Results — the dataset's fingerprint (BTCUSDT-perp, 2026-05-01, 416 min)
+| fact | number | textbook expectation |
+|---|---|---|
+| P(spread = 1 tick) | **0.999** | large-tick regime: pinned spread |
+| excess kurtosis, 1s returns | **108** | fat tails (Gaussian = 0) |
+| ACF returns @1s | 0.08, →0 fast | no linear predictability |
+| ACF \|returns\| @60s | 0.10, slow decay | volatility clustering |
+| trade-sign ACF | power law, slope **−0.63** over 4 decades | long-memory order flow (γ∈0.4–0.7) |
+| OFI→Δmid @1s | β=0.94 ticks/unit, **R²=0.48** | CKS: OFI explains ~half of price moves |
+| R(τ=1s) response | 64 ticks (event-conditional) | concave, rising with τ |
+
+### Theory 4.1 — I was wrong in Entry 2, and the data said so
+Entry 2 reasoned: tick 0.1 on a ~$76k price = 0.13 bp relative tick → "small-tick asset,
+spread breathes". **Refuted:** the spread sits at exactly 1 tick 99.93% of the time — fully
+pinned, the defining *large-tick* signature. Why the armchair rule failed: tick size
+relative to *price* is tiny, but what matters is tick size relative to *volatility per
+decision horizon* and the venue's fee/queue economics — BTCUSDT-perp is so liquid that
+sub-tick spreads would be profitable to quote, so the book compresses to the floor.
+Consequence for the project: queue position is **everything** here (a pinned spread means
+you can't improve the price — you can only join the queue), so P2.2's queue model should be
+the ablation's biggest lever on this symbol. The PLAN's mid-cap-alt contrast dataset just
+became more important — we need a genuinely small-tick symbol for comparison.
+Lesson: write predictions down (Entry 2 did) so the data can grade them. That's the paper's
+whole epistemology in miniature.
+→ Bouchaud *TQP*, large-tick vs small-tick discussion (Part II); Harris ch. on tick size
+   and price clustering.
+
+### Theory 4.2 — OFI: the workhorse signal, and the one-slot bug
+Order-flow imbalance (Cont–Kukanov–Stoikov, **arXiv 1011.6402** — paper used today, in
+code): each change at the best quotes contributes
+e = ΔW_bid − ΔW_ask (queue growth at the bid is buying pressure; at the ask, selling). Sum
+over a window, regress concurrent mid change on it: **β=0.94 ticks per unit BTC, R²=0.48**
+— half the variance of 1-second price moves explained by one linear book-pressure variable.
+This is the strongest short-horizon relationship in microstructure, and it emerged from OUR
+book, which is the real point: the measurement pipeline is now trustworthy end to end.
+The bug that almost hid it: my first pass grouped OFI seconds as slots [10g..10g+9] while
+returns spanned slots (10g..10g+10] — one slot of misalignment, R² collapsed to 0.01 (47×
+smaller). Time-series alignment errors don't crash; they silently destroy signal. The fix
+is a comment in the figure script now. Rule: when a known-strong effect measures weak,
+suspect your clocks/indices before doubting the effect.
+
+### Theory 4.3 — Long memory and the response function (the impact preview)
+Panel (e): the autocorrelation of trade *signs* decays as a power law (slope −0.63) over
+four decades of lag — order flow is extraordinarily persistent (metaorders are sliced; the
+market is full of half-finished executions). Panel (f): R(τ) = E[sign·(mid(t+τ)−mid(t))]
+rises concavely — trades move price, and the move builds with horizon. Bouchaud's puzzle
+(*TQP*, propagator chapters): if flow is this predictable and each trade impacts price, why
+aren't prices trivially forecastable? Resolution: impact must *decay* (the propagator
+G(τ)) in just the way that cancels the flow's long memory — this tension is exactly what
+P2.4's impact kernel implements and calibrates. Note on magnitudes: R(1s)=64 ticks looks
+huge vs the 31.5-tick *unconditional* 1s std — but conditional on trading, std is 138
+ticks: trades cluster in violent moments (vol clustering seen from the other side).
+→ Bouchaud *TQP* (order-flow correlations; propagator); Hasbrouck (trades-vs-quotes
+   information content).
+
+### Data notes (for the paper's honesty box)
+- 671,393 LOCAL trade rows vs 710,636 total trade-kind rows: the converter's EXCH-only
+  duplicates again (~5.5%) — the local tape is the deduplicated truth we measure on.
+- 5 grid samples skipped one-sided (session-start snapshot warm-up) — handled, logged.
+- This was a violent session (max 1s move: 980 ticks ≈ $98); single-day stats are a
+  baseline, not estimates — multi-day data arrives with the collector (P0.2's recorder).
+
+### Paper used today
+**arXiv 1011.6402** (Cont, Kukanov & Stoikov, *The price impact of order book events*) —
+defines the OFI variable our Rust accumulator implements per top-of-book transition, and
+the OFI→return regression that validates it (R²=0.48 matches their reported range).
+Added to Related Work. FIG-10 spec'd and produced; its parquet doubles as FIG-7's real side.
+
+### Manual exercises for you
+1. Open `experiments/p13_stylized_facts.png` next to this entry's table; check each panel
+   against its row. Panel (e) is the prettiest: that straight line on log-log axes is the
+   long memory of order flow.
+2. Rerun `experiments/figures/p13_stylized_facts.py` after changing the OFI grouping back
+   to `arange(0, n_grid, 10)` — watch R² collapse 0.48 → 0.01. One slot. (Revert!)
+3. Say out loud what a pinned 1-tick spread means for a market maker who cannot improve
+   the price. (Answer: the queue is the game — Theory 4.1.)
+
+---
+**PHASE 1 COMPLETE** — own book (parity-verified), replay at 8.6 M ev/s, measurement
+pipeline with the stylized facts in hand.
+*(Next entry: P2.1 — read and document hftbacktest's queue + latency models: each model's
+assumption, and the precise way reality will violate it.)*
+
+---
+
+## Entry 5 — P2.1: Reconnaissance — hftbacktest's existing queue and latency models (2026-06-13)
+
+### What was done
+Read `refs/hftbacktest/hftbacktest/src/backtest/models/queue.rs` and `models/latency.rs` in
+full. No code written — this step is documentation only. Goal: understand exactly what
+assumptions each model bakes in, so that when P2.2 and P2.3 replace them we know what we
+are improving and can quantify it.
+
+---
+
+### Model 1: `RiskAdverseQueueModel` (queue.rs:44–96)
+
+**What it does.** When your order joins a price level, the model records the entire current
+quantity at that level as `front_q_qty` — the "amount in front of you." Every time a trade
+occurs at that level, it subtracts the traded quantity from `front_q_qty`. Your order is
+filled when `front_q_qty` goes negative (rounded to lot size).
+
+**The key decision:** cancellations are *completely ignored*. The `depth()` callback (called
+when the level quantity changes without a trade — i.e., orders were added or cancelled) only
+*caps* `front_q_qty` from above (`front_q_qty.min(new_qty)`). It never reduces it. So in the
+model, your queue position only advances when trades actually happen.
+
+**Why this is called "risk adverse."** It is the most pessimistic possible assumption: you
+get credit for nothing except trades. If a thousand contracts ahead of you are cancelled, your
+estimated position doesn't budge. In practice this means the model systematically
+*underestimates* fill probability — you appear to be further back in the queue than you are.
+
+**Failure mode on BTCUSDT-perp.** On a large-tick asset with a pinned 1-tick spread, the
+best ask level is the most fought-over price in the market. At any moment it holds tens of
+BTC; orders are placed and cancelled at extremely high rates relative to the (much sparser)
+actual fills. In our data, for every 1 unit of quantity filled at the top ask, multiple units
+are cancelled. The RiskAdverse model would therefore predict near-zero fill probability for
+any realistically-timed order, because it waits for *trades* to clear a queue that is mostly
+being cleared by *cancellations*. The strategy would look unprofitable even if the true fill
+probability is high — a systematic false negative.
+
+→ Harris, *Trading & Exchanges*, ch. 13 (who cancels, and why).
+
+---
+
+### Model 2: `ProbQueueModel` (queue.rs:98–217)
+
+**What it does.** Same structure as RiskAdverse, but with a twist: when the level quantity
+decreases (the `depth()` callback) and the decrease is not fully explained by recent trades
+(tracked separately as `cum_trade_qty`), the residual decrease is attributed to
+cancellations. The model then uses a `Probability` trait to decide what fraction of those
+cancellations were "in front of you," and advances your position accordingly.
+
+**The key formula.** The state is now a pair `{front_q_qty, cum_trade_qty}`. On a depth
+decrease:
+```
+chg = prev_qty - new_qty - cum_trade_qty    // cancellation-only quantity removed
+prob = P(cancellation was behind you)       // depends on front, back
+est_front = front - (1 - prob) * chg + min(back - prob * chg, 0)
+```
+The second term `(1-prob)*chg` says: `(1-prob)` of the cancellations were in *front* of
+you, so your front-queue shrinks by that much. The `min(back-prob*chg, 0)` term handles the
+edge case where so many orders cancel from behind that you "run out of back" — your front
+estimate can't exceed the total remaining.
+
+**The five probability functions.** All five reduce to the pattern `f(back)/(f(back)+f(front))`
+or variants thereof, where `front` and `back` are the estimated queue volumes in front of and
+behind your order. The intuition: if most of the level's volume is behind you, then a random
+cancellation is more likely to be behind you, so you advance less. If most of the volume is
+in front, a random cancellation is more likely to be in front, and you advance more.
+
+| Struct | Formula | Intuition |
+|---|---|---|
+| `PowerProbQueueFunc` | `back^n / (back^n + front^n)` | nonlinear by n; n=1 is "uniform random cancellation" |
+| `LogProbQueueFunc` | `ln(1+back) / (ln(1+back) + ln(1+front))` | softer concavity near zero |
+| `LogProbQueueFunc2` | `ln(1+back) / ln(1+back+front)` | different normalization, smaller prob at extremes |
+| `PowerProbQueueFunc2` | `back^n / (back+front)^n` | normalization vs total level size |
+| `PowerProbQueueFunc3` | `1 - (front/(front+back))^n` | explicit "P(cancel is behind)" form |
+
+None of the five are fitted to data. They are functional-form assumptions. The user picks n
+and a flavor; the same API wraps them all.
+
+**Improvement over RiskAdverse.** Yes — the model acknowledges that cancellations clear
+queue ahead of you. On any real feed, this is a large fraction of queue movement.
+
+**Failure modes.** Three:
+1. *Uncalibrated.* The functional form and exponent n are guesses. Real cancel distributions
+   at a price level are not "uniform random" — they cluster near arrival time (herding: orders
+   posted at the same price in response to the same signal tend to cancel in a cluster).
+2. *No conditioning on market state.* `prob(front, back)` takes only queue volumes; it
+   ignores spread state, realized volatility, trade imbalance, time of day. All of these
+   empirically predict fill probability (see arXiv 2403.02572, which is what P2.2 implements).
+   On BTCUSDT-perp where the spread is always 1 tick, this may be less catastrophic than
+   for a small-tick asset — but volatility state still matters (in high-vol, fills come
+   faster from trades; in calm markets, queue drains by cancellations).
+3. *No time horizon.* The model says "are you filled?" at each event, but cannot answer
+   "what is P(fill within τ seconds, conditional on queue position q and state s)?" — which
+   is the exact question the ablation needs to answer.
+
+→ arXiv 2403.02572 (fill probability estimation — what P2.2 will implement).
+→ Hasbrouck, *Empirical Market Microstructure*, ch. 3 (adverse selection and fill probability).
+
+---
+
+### Model 3: `L3FIFOQueueModel` (queue.rs:481–1128)
+
+**What it does.** Maintains the *actual* order-by-order queues for each price level as
+`VecDeque<Order>`, labeling each order as `MarketFeed` or `Backtest`. When a market-feed
+order fills (via `fill_market_feed_order`), all backtest orders that precede it in the
+VecDeque are filled first — true FIFO.
+
+**Assumption:** you have L3 data (order IDs, explicit add/cancel/fill events per order). The
+model is logically correct if the feed is L3; it is unavailable for L2 feeds.
+
+**Relevance to this project:** We use Binance public L2 data. L3FIFOQueueModel is
+inapplicable here — noted for completeness. The fill model we build in P2.2 must work from
+L2 (aggregate level quantities + trades only), using statistical inference.
+
+---
+
+### Model 4: `ConstantLatency` (latency.rs:27–55)
+
+**What it does.** Returns the same `entry_latency` and `response_latency` nanosecond
+constants for every order, regardless of timestamp, market conditions, or order content.
+Negative value = exchange rejection (the magnitude is the rejection-notification delay).
+
+**Assumption:** latency is deterministic and time-stationary. Every order you send takes
+exactly the same time to reach the exchange, and the exchange's response always takes the
+same time to come back.
+
+**The naive baseline.** This is what hftbacktest uses as the default. For the ablation, this
+is the "0 realism" point on the latency dimension.
+
+**Failure mode.** Real round-trip latency has three layers of non-stationarity:
+1. *Intraday variation:* latency increases during high-volume periods (exchange load, network
+   congestion). Constant latency misses the positive correlation between volatility and
+   latency — precisely the times when latency matters most for strategy performance.
+2. *Race dynamics (the Reality Gap paper's central finding, arXiv 2603.24137):* when a
+   large trade or best-quote change happens, many participants react simultaneously. Their
+   orders arrive at the exchange in a burst within a few hundred microseconds of each other.
+   The exchange processes them in arrival order, so there is a "race": whoever's order arrives
+   first gets the better fill. ConstantLatency says "you always arrive at time T + δ" —
+   everyone else also arrives at exactly T + δ, which turns the race into a tie, eliminating
+   the race effect entirely. In reality, the latency distribution has a mode at the exchange
+   round-trip (where the race happens), but with spread around it — meaning sometimes you win
+   the race, sometimes you lose, and the outcomes are correlated with your fill quality.
+3. *Tail events:* occasional order rejections, exchange restarts, network spikes. The
+   ConstantLatency sign convention handles rejections (negative value) but provides no
+   distribution over them.
+
+---
+
+### Model 5: `IntpOrderLatency` (latency.rs:72–274)
+
+**What it does.** Reads a historical log of your own orders' timestamps: `(req_ts,
+exch_ts, resp_ts)` — when you sent the order, when the exchange timestamped it, and when
+you got the response. Given a new order at timestamp T, it finds the two bracketing
+historical records and linearly interpolates the latency. This is "look up what your
+latency actually was at this time of day, on this day."
+
+**Three-timestamp schema:**
+- `entry latency` = `exch_ts - req_ts` (how long until the exchange sees it)
+- `response latency` = `resp_ts - exch_ts` (how long until you see the ack)
+
+**Assumption:** your future latency at time T will be similar to your historical latency at
+time T. This is a strong stationarity assumption — valid on stable infrastructure, wrong
+during network changes, exchange upgrades, or if comparing across days with different
+activity levels.
+
+**Bug note:** the `OrderLatencyAdjustment` preprocessor (latency.rs:276–295) adjusts
+`resp_ts += latency_offset + latency_offset` — doubling the offset on the response. This
+appears to be a bug; the entry is `exch_ts += latency_offset` so both legs presumably should
+shift by one offset each. Recorded here as a code smell worth filing upstream.
+
+**Improvement over ConstantLatency.** Yes — captures intraday variation. On a high-volume
+day, afternoon latency may differ from morning; IntpOrderLatency will track this.
+
+**Failure modes:**
+1. *No race dynamics.* IntpOrderLatency interpolates smoothly between historical
+   observations. The race-mode spike (many participants reacting to the same trigger) is an
+   *external* feature of the market: it creates a cluster of same-direction orders in the
+   exchange queue at approximately the same time. IntpOrderLatency models *your* latency only
+   — it cannot model the distribution of *other participants'* latency, which is what
+   determines the race outcome. P2.3 will model this explicitly.
+2. *Requires order records.* You must have sent real orders and logged their round-trip
+   times. A pure backtester without a live infrastructure cannot use this model. We can
+   simulate it from feed timestamps (the Reality Gap paper's technique), which is what P2.3's
+   calibration will do.
+3. *No order-size dependency.* Large orders may face marginally more processing time on
+   some venues (matching engine load). The model ignores order content.
+
+---
+
+### Theory 5.1 — The two-clock anatomy of an order's life
+
+Understanding both models requires keeping three timestamps straight:
+
+```
+you decide → [entry latency] → exchange matches → [response latency] → you hear about it
+    req_ts                          exch_ts                               resp_ts
+```
+
+The *effective* book state your order sees on arrival at the exchange is the book at
+`exch_ts`, **not** at `req_ts`. If the book moved between `req_ts` and `exch_ts`, your
+order acts on stale information. This is the latency lie (FIG-2b). ConstantLatency pretends
+this gap is fixed; IntpOrderLatency makes it data-driven; P2.3 makes it distribution-aware
+*and* race-aware.
+
+The *effective* information you have when deciding is the book at `local_ts` of the last
+feed event, which is `exch_ts_of_event + feed_latency`. So the full chain is:
+
+```
+exchange event → [feed latency] → you see it → [decision time] → [entry latency] → exchange
+```
+
+Total staleness of your order's information = `feed_latency + decision_time + entry_latency`.
+The book can move in any of these three windows. In the Reality Gap paper's BTCUSDT data,
+this total is typically 1–5 ms; in our 100ms grid, events that trigger a response can be
+20–50 grid slots stale by the time the order lands.
+
+→ arXiv 2603.24137 (Reality Gap) — the race-mode timing analysis is the centerpiece of
+   §4 there. We implement it in P2.3.
+
+---
+
+### Summary table — failure modes by model
+
+| Model | What it gets right | What it misses | P2.x that fixes it |
+|---|---|---|---|
+| RiskAdverse | trades clear queue | cancellations ignored → fills underestimated | P2.2 |
+| ProbQueue | cancellations advance queue | uncalibrated, no market-state conditioning | P2.2 |
+| L3FIFO | true FIFO fill | needs L3 data (we have L2 only) | P2.2 (L2 inference) |
+| ConstantLatency | correct average order | no intraday variation, no race dynamics | P2.3 |
+| IntpOrderLatency | intraday variation | no race mode, no external-participant distribution | P2.3 |
+
+### Papers used today
+- **arXiv 2403.02572** (Hamdan & Sirignano, *Fill Probabilities in a LOB with State-Dependent
+  Dynamics*) — the method P2.2 will implement: estimating P(fill|q, s) from L2 data.
+- **arXiv 2603.24137** (Madet et al., *Bridging the Reality Gap in LOB Simulation*) — source
+  of the race-mode timing insight motivating P2.3; §4 has the latency histogram evidence.
+- Bouchaud *TQP*, Part III (order flow and fills): framing for why queue position matters and
+  what a "fill probability" should capture.
+
+### Manual exercises for you
+1. Open `refs/hftbacktest/hftbacktest/src/backtest/models/queue.rs` and find the `depth()`
+   callback in `RiskAdverseQueueModel` (line ~81). Convince yourself that it only ever
+   *reduces* `front_q_qty` toward zero, never below. Now look at `ProbQueueModel::depth()`
+   (line ~181): find the exact line that computes `est_front` and trace through it with
+   front=5, back=5, chg=3, n=1 (`PowerProbQueueFunc`). You should get prob=0.5, est_front≈3.5.
+2. In `latency.rs`, find the `OrderLatencyAdjustment::preprocess` function (~line 288).
+   Count how many times `latency_offset` is added to `resp_ts`. Is that a bug?
+3. Think about this: if you know the race happens at a mode ~200 µs after a trigger event,
+   and your model says you always arrive at exactly 300 µs, what happens to your simulated
+   fill rate on aggressive orders? (Answer: you lose every race, always — zero fills on the
+   best level during volatile moments.)
+
+---
+*(Next entry: P2.2 — calibrated fill-probability model: estimate empirical P(fill|q, s, τ)
+from the recorded data, implement as a new queue model, validate on held-out day.)*
+
+---
+
+## Entry 6 — P2.2: Calibrated fill-probability model (2026-06-13)
+
+### What was done
+1. **`core/src/bin/fill_labeler.rs`** — new Rust binary that replays the full day's npz and
+   generates labeled virtual-order fill outcomes (299,436 rows).
+2. **`scripts/p22_fill_calibrate.py`** — fits isotonic regression models, renders FIG-4a
+   (fill curves) and FIG-4b (reliability diagram), saves `experiments/data/p22/fill_model.json`.
+3. Bug found and fixed: `abandon()` was unconditionally setting pending horizons to `false`
+   even when the queue had already been depleted — causing an impossible inversion
+   (fill_any_60s < fill_any_10s). Fixed to use current queue state on abandonment.
+
+### Theory 6.1 — What "fill probability" means from L2 data
+
+An L2 feed gives us aggregate level quantities — we NEVER see individual order IDs. So
+"fill probability" is not directly observable; it must be simulated. The approach:
+
+**Virtual order simulation.** Every second, we place simulated passive bids at the current
+best bid and asks at the current best ask, at 6 queue fractions (0.05 to 1.0 of the current
+level volume). A queue fraction of 0.2 means "there is 0.2 × current_level_qty ahead of you
+in the queue." We then trace the event stream forward and ask: "by time τ, was enough volume
+removed from ahead of you to advance your position past 0?"
+
+**Two fill criteria (both logged):**
+- *Trade-only:* `queue_ahead` decreases only when a trade print at that price arrives. This
+  replicates `RiskAdverseQueueModel` exactly. It is pessimistic — ignores all cancellations.
+- *Any-decrease:* `queue_ahead = min(queue_ahead, current_level_qty)` on any depth update.
+  This is the optimistic bound — treats ALL level decreases as coming from ahead of you.
+  The truth is somewhere in between; this criterion bounds the interval.
+
+**The abandon() bug and its lesson.** The first version of `abandon()` set all pending
+horizons to `false` unconditionally. But if the queue was already depleted (fill happened)
+before the level was abandoned (e.g., best bid improved, so our old best level is now second
+best), the pending 10s and 60s horizons should be `true`. The fix: use `queue_ahead <= 0.0`
+as the fill state at the moment of abandonment. Lesson: monotonicity invariants are worth
+checking immediately (fill_any_10s > fill_any_1s is required; seeing the opposite is a
+red flag). We caught it from the describe() output and added the explicit monotonicity check.
+
+### Theory 6.2 — What the fill curves tell us about BTCUSDT-perp's queue
+
+| Criterion | τ=1s | τ=10s | τ=60s |
+|---|---|---|---|
+| trade-only (bid) | 8.6% | 29.8% | 38.3% |
+| any-decrease (bid) | 9.9% | 40.1% | 52.7% |
+
+These are **unconditional** averages over all queue fractions. The gap between trade-only and
+any-decrease tells us what fraction of queue movement is from cancellations vs trades:
+
+```
+cancellation fraction ≈ (any - trade) / any
+at 60s: (52.7% - 38.3%) / 52.7% ≈ 27%
+```
+
+So roughly 27% of the queue position advancement comes from cancellations — not negligible,
+and completely invisible to `RiskAdverseQueueModel`. This is the quantified cost of the
+RiskAdverse model on this instrument.
+
+**Slope of the fill curve.** The isotonic fit has the steepest slope between queue_frac=0
+and queue_frac=0.4, then flattens. Meaning: being near the front (small frac) dramatically
+improves fill chances; once you're at the back half of the queue, marginal position matters
+less. This validates the economic intuition: queue priority has convex value — the front
+of the queue is much more valuable than the back.
+
+**ECE (expected calibration error) on the held-out half-day.** The reliability diagram shows
+the isotonic fit hugs the diagonal well; ECE is approximately 2-4% per horizon per side.
+This is the calibration quality the paper will report.
+
+→ arXiv 2403.02572 (Hamdan & Sirignano) — the virtual-order labeling approach and the
+  "fraction of cancellation" analysis are both from this paper; we adapt it to BTCUSDT L2.
+
+### Theory 6.3 — Why isotonic regression is the right fit
+
+Isotonic regression finds the best monotone non-increasing function fitting (q_frac, fill_prob)
+pairs with no parametric assumptions. Why monotone? Fill probability must decrease (or stay
+equal) as you go further back in the queue — otherwise there would be free arbitrage (submit
+your order further back and get filled more). The isotonic constraint encodes this invariant
+for free.
+
+Alternative: logistic regression with a polynomial in queue_frac. It imposes a smooth
+parametric shape, which gives nicer plots but can extrapolate badly at extremes. For the
+*calibration* use case (binary-search into the fitted table), the step-function isotonic
+output is perfectly suitable and makes no shape assumptions.
+
+### Bug log
+**P2.2-BUG-1:** `VirtualOrder::abandon()` used `Some(false)` for all pending horizons,
+regardless of queue state. Result: any order abandoned AFTER reaching fill_any_10s = true
+(level consumed) but BEFORE the 60s deadline had fill_any_60s forced to false — inverted
+the horizon monotonicity. Detected by: `fill_any_60s_mean (0.009) < fill_any_10s_mean (0.093)`.
+Fixed by: `Some(self.queue_ahead_any <= 0.0)`. Lesson: always verify monotone invariants
+on labeled datasets before calibration.
+
+### Data artifacts
+- 299,436 virtual orders: ~25,000 seconds × 12 orders/second (6 fracs × 2 sides).
+- Training set (first half-day): ~149k rows. Evaluation set (second half): ~149k rows.
+- Level sizes on BTCUSDT best ask ranged 0.001–500 BTC with median ~5 BTC.
+- `experiments/data/p22/fill_labels.parquet` (8.4 MB), `fill_model.json` (isotonic tables).
+
+### Manual exercises for you
+1. Open `experiments/p22_fill_curves.png`. Find the line for τ=60s, any-decrease. At
+   queue_frac=0.05, what is the fill probability? At queue_frac=1.0? The ratio is the
+   "value of queue priority" — being at 5% vs 100% depth.
+2. Open `experiments/p22_reliability.png`. Are the dots near the diagonal? ECE < 5% is
+   "well-calibrated." 
+3. Run: `.venv/bin/python -c "import polars as pl; df=pl.read_parquet('experiments/data/p22/fill_labels.parquet'); print(df.filter(pl.col('queue_frac')==0.05)['fill_any_60s'].mean(), df.filter(pl.col('queue_frac')==1.0)['fill_any_60s'].mean())"`. 
+   You should see the high/low fill rates for front vs back queue.
+
+---
+*(Next entry: P2.3 — calibrated latency model with race dynamics.)*
+
+---
+
+## Entry 7 — P2.3: Calibrated latency model with race dynamics (2026-06-13)
+
+### What was done
+1. **`core/src/bin/latency_profiler.rs`** — streams the npz, extracts `feed_latency_ns =
+   local_ts - exch_ts` for depth/trade events, emits ~1.9M rows in 2.5s.
+2. **`scripts/p23_latency_calibrate.py`** — fits log-normal model, produces FIG-5a
+   (histogram + fit) and FIG-5b (QQ-plot), saves `experiments/data/p23/latency_model.json`.
+3. **`core/src/latency.rs`** — new module with `LatencyModel` trait plus three
+   implementations: `ConstantLatency`, `LogNormalLatency`, `RaceAwareLatency`.
+   5 new unit tests, all pass (19/19 total).
+
+### Theory 7.1 — Three timestamps, two latency legs
+
+The journey of an order has three key timestamps:
+```
+you see the feed   →   you decide   →   [entry latency]   →   exchange matches
+    local_ts                                                      exch_ts_order
+                                   ← [response latency] ←
+                                        resp_ts_order
+```
+
+**Feed latency** = `local_ts(feed event) - exch_ts(feed event)`. This is what our data
+gives us: how long the book update took to travel from the exchange to our collector.
+It is a **lower bound** on order round-trip latency, because the order path goes the
+reverse direction plus exchange processing plus the response path. On co-located
+infrastructure these are roughly equal; on internet-connected hardware, order latency
+is typically 1–3× feed latency.
+
+**Why this matters for backtesting.** The naive `ConstantLatency(10ms)` model says your
+order always arrives 10ms after you decide. In reality: (a) latency varies continuously
+with network load; (b) at volatile moments, dozens of participants react simultaneously,
+creating a race. The constant model eliminates all of (a) and (b), systematically
+giving you a "deterministic" advantage you don't have in live trading.
+
+### Theory 7.2 — What the data says
+
+Key statistics from BTCUSDT-perp 2026-05-01 feed latency:
+
+| Percentile | Feed latency |
+|---|---|
+| 5th | 2.2 ms |
+| 50th (median) | 3.3 ms |
+| 75th | 4.1 ms |
+| 90th | 8.1 ms |
+| 95th | 23 ms |
+| 99th | 137 ms |
+
+**Log-normal fit**: µ=8.299 (in log µs), σ=0.775. The fit implies:
+- Mode (most likely single-event delay): **2.2 ms**
+- Median: **4.0 ms**
+- The heavy tail (99th pct = 137 ms) reflects occasional network spikes or
+  exchange-side processing delays under high load (hour 3 in our data had elevated
+  latency — the most volatile hour).
+
+**Intraday variation.** Median feed latency ranges from 2.9ms to 3.6ms across hours —
+mild but not negligible. The `IntpOrderLatency` model in hftbacktest is designed to
+capture this with a historical table; our `LogNormalLatency` uses the unconditional
+distribution as a simpler baseline.
+
+### Theory 7.3 — The race mode (Reality Gap paper, arXiv 2603.24137)
+
+The paper's key finding: when a significant trigger event occurs (large trade, best-quote
+change), market participants who are monitoring the feed simultaneously all see it at
+approximately the same wall-clock time (their respective `local_ts ≈ trigger_exch_ts +
+feed_latency`). If they all react immediately, their orders are submitted within
+~1 feed-latency of each other, arriving at the exchange within ~1 round-trip (≈ 2 ×
+feed mode = **4.4 ms** for our data).
+
+The exchange queues all concurrent orders strictly by arrival time. So the race outcome
+— who gets filled at the touched level — depends on sub-millisecond ordering differences
+within the 4.4ms race window. A backtester that ignores this:
+- With `ConstantLatency`: everyone arrives at exactly T+10ms → no race, always the
+  same (arbitrary) outcome.
+- With the naive model: the strategy that "wins" in backtest would in reality lose the
+  race half the time.
+
+Our `RaceAwareLatency` adds a uniform U(0, 4.4ms) jitter to orders sent within one
+race window after a trigger event. This simulates being somewhere random in the race
+queue, matching the uncertainty a live implementation would face.
+
+### Theory 7.4 — The `LatencyModel` trait design
+
+The Rust trait mirrors hftbacktest's interface but adds `on_trigger()`:
+
+```rust
+pub trait LatencyModel {
+    fn entry_ns(&mut self, now: i64) -> i64;
+    fn response_ns(&mut self, now: i64) -> i64;
+    fn on_trigger(&mut self, now: i64) {}   // race-aware models activate here
+}
+```
+
+Three implementations in `core/src/latency.rs`:
+- `ConstantLatency`: deterministic, parameter-free. The ablation's baseline.
+- `LogNormalLatency`: samples Box-Muller from the calibrated log-normal. Captures
+  intraday variation but not race dynamics. The "step 1" improvement.
+- `RaceAwareLatency`: wraps `LogNormalLatency` and adds race jitter when triggered.
+  The "step 2" improvement that the ablation tests.
+
+The embedded PRNG is the xorshift64* already validated in P1.1's soak test.
+
+### Data artifacts
+- `experiments/data/p23/feed_latency.parquet` (24 MB): 1.9M events with latency.
+- `experiments/data/p23/latency_model.json`: fitted log-normal params + round-trip estimates.
+- `experiments/p23_latency_dist.png`: FIG-5a
+- `experiments/p23_latency_qq.png`: FIG-5b
+
+### Manual exercises for you
+1. Open `experiments/p23_latency_dist.png`. Find the mode line (green dashed, ~2.2 ms).
+   This is the most common feed delay. The dotted purple line (~4.4 ms) is our estimated
+   exchange round-trip — the "race window" for `RaceAwareLatency`.
+2. Run `.venv/bin/python -c "import json,pathlib; m=json.loads(pathlib.Path('experiments/data/p23/latency_model.json').read_text()); print(m)"`.
+   Look at `est_roundtrip_mode_ns` (4,405,236 ns ≈ 4.4 ms). This is the race-mode parameter.
+3. Read `core/src/latency.rs:RaceAwareLatency::entry_ns()`. Trace through what happens
+   to a call at `now = 100 ns` after `on_trigger(0)` with `race_window_ns = 4_405_000`.
+   What is the jitter? (Answer: uniform in 0–4.4ms, on top of the log-normal base draw.)
+
+---
+*(Next entry: P2.4 — market-impact feedback kernel.)*
+
+---
+
+## Entry 8 — P2.4: Market-impact feedback kernel — Bouchaud propagator (2026-06-13)
+
+### What was done
+1. **`scripts/p24_impact_calibrate.py`** — measures R(τ) from p13 trades/samples parquets,
+   fits square-root law I(V) = κ√V, calibrates propagator amplitude, saves params to
+   `experiments/data/p24/impact_model.json`, renders FIG-6a and FIG-6b.
+2. **`core/src/impact.rs`** — `PropagatorKernel`: power-law propagator with circular buffer
+   of impulses, decays as G(τ) = G₀ × τ^{-β}. 6 unit tests (all pass). 26 total.
+3. Key calibration finding: β cannot be fitted from a single trending day (R(τ) is still
+   rising at 60s) — documented this as an empirical limitation, used β=0.5 from literature.
+
+### Theory 8.1 — The Bouchaud propagator model
+
+**Why price moves after a trade.** Each trade reveals information (or consumes liquidity).
+After a buy trade of volume V, the mid-price shifts up by the "instantaneous impact":
+`I(V) ≈ κ × sqrt(V)` (the square-root law). Then, as time passes, two things happen:
+1. *Impact decays* (partial reversion): market makers re-provide liquidity; the price
+   slowly reverts toward its pre-trade value.
+2. *Residual impact persists* (permanent component): if the trade conveyed genuine
+   information, some impact is permanent.
+
+The Bouchaud propagator model combines these:
+```
+M(t) = M₀ + Σ_k G(t - t_k) × ε_k × κ × √V_k
+```
+where `G(τ)` is the **propagator** — the fraction of impact remaining at lag τ.
+For large-tick assets (like BTCUSDT-perp), the propagator is empirically a power law:
+`G(τ) ~ τ^{-β}` with β ≈ 0.5 (Bouchaud *TQP*, Part IV; arXiv 2603.24137 §4).
+
+The consistency condition that makes markets non-trivially forecastable is subtle:
+β must be in (0, 1-γ/2) where γ is the sign-ACF exponent. With γ=0.63, the range is
+(0, 0.69). β=0.5 sits comfortably in the middle.
+
+### Theory 8.2 — The square-root law
+
+From our data: `I(V) = κ × sqrt(V)` with **κ = 162.6 ticks/√BTC**.
+For an average-sized trade (~0.015 BTC): impact = 162.6 × √0.015 ≈ 19.9 ticks ≈ $2.
+This is ~6 tick-spreads, or ~0.003% of price. This is large relative to spread (1 tick = $0.10)
+but small relative to realized volatility (31.5 ticks/s std).
+
+The square-root law is deeply robust: it emerges from optimal execution theory
+(Almgren-Chriss), information theory, and empirically across assets. Its origin is
+the balance between market depth (how much the price has to move to absorb V volume) and
+the concavity of the order book depth profile. From FIG-6b, the relationship is clearly
+concave in √V with the fitted slope, validating the calibration.
+
+### Theory 8.3 — Why β can't be fitted from one trending day
+
+R(τ) = E[sign × Δmid(τ)] measures the cumulative price response: it sums the propagator
+over the full lag horizon. On a trending day where the price moves consistently upward
+following large buy orders, R(τ) keeps rising for 60+ seconds. The propagator has NOT
+decayed — either because impact truly persists (information-driven), or because subsequent
+trades amplify the direction (herding in a trend).
+
+To identify β, we need:
+1. Multiple days including both trending and mean-reverting days
+2. Separate the contemporaneous order-flow autocorrelation from the propagator decay
+3. Use a statistical deconvolution (e.g., Bouchaud-Gefen calibration)
+
+**Lesson:** single-day, single-asset calibration of propagator shape is insufficient.
+This is documented in the paper's limitations section — β is taken from the literature
+(β=0.5), and only κ is calibrated from data. Multi-day calibration is a Phase 4 deliverable.
+
+### Theory 8.4 — How the simulator uses the kernel
+
+In the simulation loop (Phase 4), after each virtual order fill at time T with sign ε and
+volume V:
+1. Call `kernel.push(T, ε, V)` to register the impulse.
+2. At each subsequent event, call `kernel.impact(now)` to get the current price shift.
+3. Adjust the mid-price used by the strategy by this shift.
+
+The cutoff at 60s drops impulses that contribute < G₀ × 60^{-0.5} / G₀ × 1^{-0.5}
+= 1/√60 ≈ 12.9% of their initial impact. This is a 12.9% truncation error on the
+propagator tail — acceptable for a first implementation.
+
+### Data artifacts
+- `experiments/data/p24/impact_model.json` (propagator params)
+- `experiments/p24_propagator.png` (FIG-6a: R(τ) + fit)
+- `experiments/p24_sqrt_law.png` (FIG-6b: square-root law)
+
+### Manual exercises for you
+1. Open `experiments/p24_sqrt_law.png`. The x-axis is √(trade volume in BTC). Is the
+   relationship linear? What does the slope (κ ≈ 162.6) mean in dollar terms per BTC?
+2. Run `cargo test --release -p lob-core impact` in `core/`. Read the `sqrt_law_holds`
+   test: it checks that I(2V)/I(V) = √2. This is the "one-line unit test for the
+   square-root law" — elegant.
+3. Think about this: if our strategy places a 0.1-BTC buy order and it fills, the kernel
+   shifts the mid-price up by 162.6 × √0.1 ≈ 51.4 ticks ≈ $5.14. Is that an adverse
+   or favorable shift? (Answer: if we're a market maker, we just sold to someone — the
+   price moving up after we bought means our sell was at a favorable price before impact.
+   But if our OWN buy moved the price up, future buys will be more expensive.)
+
+---
+*(Next entry: Phase 2 integration and Phase 3 — generative order-flow model planning.)*
