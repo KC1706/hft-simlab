@@ -1058,3 +1058,108 @@ propagator tail — acceptable for a first implementation.
 
 ---
 *(Next entry: Phase 2 integration and Phase 3 — generative order-flow model planning.)*
+
+---
+
+## Entry 9 — P2.5: Phase-2 integration — the unified realism backtest (2026-06-28)
+
+### What was done
+The three calibrated models built in isolation (P2.2 fill, P2.3 latency, P2.4 impact)
+are now wired into one backtest that runs a strategy through *our* book and toggles
+each layer independently — the harness that produces the project's headline ablation.
+
+1. **`core/src/fill.rs` + `core/src/fill_tables.rs`** — the P2.2 fill model, until now a
+   Python-only artifact (`experiments/data/p22/fill_model.json`), brought into Rust.
+   `scripts/p25_gen_fill_tables.py` bakes the twelve isotonic curves into `const` arrays
+   (the same "bake the calibrated constants into Rust" pattern as
+   `PropagatorKernel::calibrated()` and `calibrated_race_latency()` — no runtime JSON
+   dependency). `CalibratedFillModel::p_fill(side, criterion, horizon, queue_frac)`
+   linearly interpolates them. 6 unit tests assert the invariants the calibration must
+   preserve: unit range, monotone-non-increasing in `queue_frac`, horizon ordering
+   (P(60s) ≥ P(10s) ≥ P(1s)), and any-decrease ≥ trade-only.
+2. **`core/src/bin/backtest.rs`** — the ablation engine. Streams the LOCAL event view
+   (dispatch identical to `bin/replay.rs`), runs the Phase-0 naive market maker
+   (mid ± 60 ticks, inventory skew, 0.001 BTC, ±0.005 cap, 2 bps maker fee), and runs it
+   four times under `{naive | +fill | +fill+latency | +fill+latency+impact}`.
+
+### Theory 9.1 — A queue model *is* a fill model: closing lie #1 in the loop
+
+Entry 0's first lie was the **fill lie** — the naive backtester fills a passive order the
+instant price *touches* it. Our naive config reproduces exactly that: a resting bid fills
+in an interval iff a sell trade printed at or through its price (`min_sell_px ≤ bid_px`).
+The `+fill` config replaces that deterministic touch with a *draw*: each second, an active
+resting order fills with the calibrated probability `P(fill within 1s | queue_frac)`,
+where `queue_frac = depth_at_my_price / (depth + my_qty)` — near 1.0 when we join behind
+real resting size, 0.0 at an empty price. This is the calibrated `QueueModel` PLAN P2.2
+asked for, now *acting inside a backtest* rather than being plotted on a calibration chart.
+→ Hasbrouck, *Empirical Market Microstructure*, ch. 3 (fill probability and adverse
+   selection); the queue-position economics are Moallemi–Yuan (PLAN paper map).
+
+### Theory 9.2 — Impact feedback makes the replay answer back
+
+In `+...+impact`, every fill calls `kernel.push(t, ±1, qty)` and each requote reads
+`eff_mid = book.mid() + kernel.impact(t) · tick`. So our own trading now bends the price
+the strategy quotes around — the recorded tape stops being a frozen movie (lie #3). With
+0.001 BTC clips the propagator shift is tiny per fill, but it is *directionally honest*:
+after we buy, the mid we next quote around is nudged up (we chase our own footprint),
+and the kernel's power-law decay (β = 0.5, Bouchaud propagator, Entry 8) reverts it.
+→ Bouchaud *TQP*, Part IV (propagator, square-root impact).
+
+### Results — the first ablation table (BTCUSDT-perp 2026-05-01, seed 42)
+
+| config | fills | PnL (USDT) | fees | end pos |
+|---|---|---|---|---|
+| naive | 1,313 | −29.63 | 20.20 | −0.0050 |
+| +fill | 3,523 | −33.26 | 54.13 | −0.0010 |
+| +fill+latency | 3,523 | −33.26 | 54.13 | −0.0010 |
+| +fill+latency+impact | 3,597 | −31.26 | 55.28 | −0.0010 |
+
+Reading it like a microstructurist:
+- **Calibrated fills ≈ 2.7× the naive fill count.** The naive touch rule almost never
+  fires on quotes posted 60 ticks deep (price rarely trades 60 ticks through in 1s on a
+  1-tick-spread book), so the naive MM is *accidentally* protected by being unfillable.
+  The calibrated model assigns those deep quotes their real (small but non-zero) fill
+  hazard — more fills, more fees, and the PnL worsens by the fee + adverse-selection
+  difference. This is the fill lie quantified: naive backtests of passive strategies can
+  *understate* activity and therefore cost.
+- **+impact** perturbs the result measurably (PnL −33.26 → −31.26, +74 fills): once our
+  fills move the quoted mid, the requote prices shift and a slightly different fill
+  sequence unfolds. Small at this clip size, real in sign.
+- All configs end pinned at the short cap on a violently *rising* day — the naive baseline
+  inheriting Entry 1's adverse-selection story.
+
+### Theory 9.3 — The honest null result: latency is invisible at a 1s grid
+
+`+fill+latency` is **identical** to `+fill`. This is not a bug; it is a measurement
+limitation worth stating plainly. The latency layer only delays when a quote becomes
+*fillable* (`active_ts = now + entry_ns`), and entry latency is milliseconds (Entry 7:
+mode 2.2 ms, median 4 ms). On a 1,000 ms decision grid, `now + 4ms` never crosses a grid
+boundary, so the order is fillable in the very same interval it would have been without
+latency — zero effect. This is fully consistent with the theory: latency does its damage
+at the **sub-second race scale** (Entry 7's `RaceAwareLatency`, the Reality-Gap paper's
+±4.4 ms race window), which a 1 s fill grid cannot resolve. Exposing the latency layer's
+PnL contribution requires **event-level** fill evaluation (resolve fills against the
+actual order stream between grid points, with race ordering), which is a Phase 4
+refinement of this harness. Logged here so the ablation table is read honestly: today it
+measures the **fill** and **impact** layers; latency awaits finer time resolution.
+→ This is the same epistemic move as Entry 8's β (taken from literature, limitation
+   documented): report what the data/grid can support, name what it cannot.
+
+### Limitations (for the paper's honesty box)
+- Single resting order per side; `queue_frac` is a depth-ratio proxy, not a tracked
+  position that advances within the interval. Phase 4's event-level engine fixes both.
+- The 1s grid hides latency (Theory 9.3) and coarsens impact.
+- One day, one symbol, one seed — these are a wiring proof, not estimates. The numbers
+  move with the seed; the *ordering* and the mechanism are the result, not the decimals.
+
+### Manual test for you (P2.5 gate)
+1. `cd hft-simlab/core && cargo test` — expect 32 green (26 + 6 new `fill::` tests). Skim
+   the `fill::tests` names: they are the calibrated model's contract on one screen.
+2. `cargo build --release && ./target/release/backtest ../data/btcusdt_20260501_0000_0656.npz`
+   — read the four rows against Theory 9.1–9.3. Predict first: will calibrated fills be
+   *more* or *fewer* than naive for quotes posted 60 ticks deep? (Answer: more — Theory 9.2.)
+3. Rerun with `--seed 7`. The decimals move, the row *ordering* and the +impact direction
+   should not. Say in one sentence why `+latency` equals `+fill` here (Theory 9.3).
+
+---
+*(Next entry: P2.6 — event-level fill/latency refinement, then Phase 3 generative market planning.)*
