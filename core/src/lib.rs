@@ -18,5 +18,7 @@
 
 pub mod book;
 pub mod events;
+pub mod npz;
 
 pub use book::{BookState, L2Book, Level, Side};
+pub use npz::NpzEventReader;
