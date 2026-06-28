@@ -1231,5 +1231,17 @@ count and flatters PnL by erasing the tail/race timing that does the damage.
    slower constant baseline? (Answer: tail + race timing — Theory 10.1 / Results.)
 
 ---
+
+**PHASE 2 COMPLETE** — the realism layer, calibrated and ablatable. Three models built
+from real BTCUSDT data and ported into the Rust core: a calibrated fill/queue model
+(P2.2 — isotonic `P(fill | queue_frac)`, replacing hftbacktest's uncalibrated queue
+models), a race-aware log-normal latency model (P2.3), and a Bouchaud impact propagator
+(P2.4 — square-root law, power-law decay). All three are wired into one **event-level
+ablation backtest** (P2.5/P2.6) where each layer toggles independently and each
+*measurably* moves PnL — the fill, latency, and impact lies of Entry 0, now quantified
+rather than asserted. Known first-cut approximations (single resting order, depth-ratio
+`queue_frac`, memoryless fill hazard) are documented in Entries 9–10 and scheduled for
+the Phase-4 fidelity pass.
+
 *(Next entry: P3 — generative counterfactual market: scope the TRADES/diffusion model to
 our crypto L2 format and the Kaggle free-tier training plan.)*
