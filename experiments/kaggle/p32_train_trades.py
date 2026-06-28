@@ -23,6 +23,11 @@ import shutil
 import sys
 from pathlib import Path
 
+# Force a single GPU: Kaggle's T4 x2 makes Lightning default to distributed (DDP), whose
+# subprocess re-launcher breaks under our chdir. One GPU is plenty for a ~10M model.
+# Must be set before torch is imported (DeepMarket imports it transitively).
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -34,6 +39,7 @@ def main():
     ap.add_argument("--epochs", type=int, default=50)
     ap.add_argument("--batch-size", type=int, default=256)
     ap.add_argument("--smoke", action="store_true", help="tiny wiring test (depth 1, 1 epoch)")
+    ap.add_argument("--count-only", action="store_true", help="print param count for the given dims and exit")
     args = ap.parse_args()
 
     dm = Path(args.deepmarket).resolve()
@@ -95,6 +101,10 @@ def main():
             print(f"[warn] {n_params/1e6:.1f}M is outside the 5-15M target — adjust --augment-dim/--depth")
     except Exception as e:  # counting is best-effort; training still proceeds
         print(f"[model] param-count probe skipped ({type(e).__name__}: {e})")
+
+    if args.count_only:
+        print("[count-only] exiting before training.")
+        return
 
     # 4) Train. run() builds the Lightning Trainer (EarlyStopping on val_ema_loss) and fits.
     accelerator = "gpu" if cst.DEVICE.startswith("cuda") else "cpu"
