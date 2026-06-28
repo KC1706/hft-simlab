@@ -1,23 +1,28 @@
-//! P2.5 — Unified realism backtest: the Phase-2 integration step.
+//! P2.5/P2.6 — Unified realism backtest with **event-level** fills.
 //!
-//! Runs the Phase-0 naive market maker through *our* book/replay, but now with the
-//! three calibrated realism layers wired in and individually toggleable, so one run
-//! emits the ablation table that is the project's headline measurement:
+//! Runs the Phase-0 naive market maker through *our* book/replay with the three
+//! calibrated realism layers wired in and individually toggleable, emitting the
+//! ablation table that is the project's headline measurement:
 //!
 //!   { naive | +fill | +fill+latency | +fill+latency+impact }
 //!
-//! - **fill**    (P2.2): a resting quote fills, per 1 s interval, with the calibrated
-//!                probability P(fill | queue_frac) instead of the naive touch rule.
-//! - **latency** (P2.3): a (re)quote decided at T is not fillable until T + entry
-//!                latency drawn from the calibrated (race-aware) model.
+//! - **fill**    (P2.2): a resting quote does not fill on a grid boundary; it is given
+//!                a continuous *fill time* `active_ts + Exp(λ)`, where λ is chosen so the
+//!                probability of filling within 1 s equals the calibrated
+//!                `P(fill | queue_frac)`. Naive fills instead match the real trade stream
+//!                at event time (sell-trade ≤ bid / buy-trade ≥ ask).
+//! - **latency** (P2.3): a (re)quote decided at T is not fillable until `active_ts =
+//!                T + entry_latency`; since the fill time is measured from `active_ts`,
+//!                higher/heavier-tailed latency pushes fills past the next requote and
+//!                they are cancelled unfilled — so latency now has a measurable PnL effect
+//!                (the P2.6 fix for Entry 9's grid-level null result).
 //! - **impact**  (P2.4): each of our fills pushes a propagator impulse that shifts the
 //!                mid the strategy quotes around (replay stops being a frozen movie).
 //!
-//! First-cut modeling choices (documented as limitations in docs/JOURNAL.md Entry 9):
-//! the strategy holds at most one resting order per side; queue_frac is estimated from
-//! the resting depth at the quote price; fills are evaluated on the 1 s grid against the
-//! 1 s fill curve; naive fills use interval trade-through (sell-trade <= bid / buy-trade
-//! >= ask). Honest enough to rank the realism layers; Phase 4 refines it.
+//! Modeling choices (limitations in docs/JOURNAL.md Entries 9–10): one resting order per
+//! side; `queue_frac` is the resting-depth ratio at the quote price; the calibrated
+//! hazard is exponential matched to the 1 s curve (memoryless approximation of the
+//! isotonic horizon). Honest enough to rank the realism layers; Phase 4 refines further.
 //!
 //! Usage: backtest <file.npz> [--seed N] [--grid-ms N]
 
@@ -35,6 +40,7 @@ use lob_core::NpzEventReader;
 
 const TICK_SIZE: f64 = 0.1;
 const LOT_SIZE: f64 = 0.001;
+const NS_PER_S: f64 = 1_000_000_000.0;
 
 // Strategy params — identical to scripts/p0_backtest.py so the ablation is comparable.
 const HALF_SPREAD_TICKS: f64 = 60.0;
@@ -44,12 +50,13 @@ const MAX_POSITION: f64 = 0.005; // BTC
 const MAKER_FEE: f64 = 0.0002; // 2 bps, post-only (GTX)
 const NAIVE_LATENCY_NS: i64 = 10_000_000; // 10 ms constant baseline
 
-/// One resting virtual order.
+/// One resting virtual order. `fill_time` is the scheduled calibrated fill instant
+/// (`i64::MAX` = never / naive path); `active_ts` is when it becomes fillable.
 #[derive(Clone, Copy)]
 struct Order {
     px: f64,
-    active_ts: i64, // fillable only once now >= active_ts (entry latency)
-    queue_frac: f64,
+    active_ts: i64,
+    fill_time: i64,
 }
 
 #[derive(Clone, Copy)]
@@ -68,11 +75,10 @@ struct Stats {
     fees: f64,
     final_equity: f64,
     final_position: f64,
-    n_quotes: u64,
+    cancelled_unfilled: u64, // orders requoted away before their scheduled fill
 }
 
-/// Inline xorshift64* — same generator the rest of the crate uses (book.rs soak,
-/// latency.rs), kept local so the binary owns its own deterministic stream.
+/// Inline xorshift64* — same generator the rest of the crate uses.
 struct Xor64(u64);
 impl Xor64 {
     fn new(seed: u64) -> Self {
@@ -88,199 +94,217 @@ impl Xor64 {
     }
 }
 
+/// Convert a 1 s cumulative fill probability into a scheduled fill instant measured from
+/// `active_ts`, via the memoryless (exponential) hazard with the matching 1 s mass.
+fn schedule_fill_time(active_ts: i64, p_1s: f64, rng: &mut Xor64) -> i64 {
+    if p_1s <= 0.0 {
+        return i64::MAX;
+    }
+    let lambda = -(1.0 - p_1s.min(0.999999)).ln(); // per second
+    let u = rng.next_f64().min(1.0 - 1e-12);
+    let dt_s = -(1.0 - u).ln() / lambda; // Exp(lambda) draw, seconds
+    let dt_ns = (dt_s * NS_PER_S).min(i64::MAX as f64) as i64;
+    active_ts.saturating_add(dt_ns)
+}
+
+struct Sim {
+    cfg: Config,
+    book: L2Book,
+    fill_model: CalibratedFillModel,
+    latency: Box<dyn LatencyModel>,
+    kernel: PropagatorKernel,
+    rng: Xor64,
+    cash: f64,
+    position: f64,
+    bid: Option<Order>,
+    ask: Option<Order>,
+    stats: Stats,
+}
+
+impl Sim {
+    fn fill_bid(&mut self, o: Order, at: i64) {
+        self.position += ORDER_QTY;
+        self.cash -= o.px * ORDER_QTY;
+        let fee = MAKER_FEE * o.px * ORDER_QTY;
+        self.cash -= fee;
+        self.stats.fees += fee;
+        self.stats.fills += 1;
+        self.stats.buy_fills += 1;
+        if self.cfg.impact {
+            self.kernel.push(at, 1.0, ORDER_QTY);
+        }
+        self.bid = None;
+    }
+
+    fn fill_ask(&mut self, o: Order, at: i64) {
+        self.position -= ORDER_QTY;
+        self.cash += o.px * ORDER_QTY;
+        let fee = MAKER_FEE * o.px * ORDER_QTY;
+        self.cash -= fee;
+        self.stats.fees += fee;
+        self.stats.fills += 1;
+        self.stats.sell_fills += 1;
+        if self.cfg.impact {
+            self.kernel.push(at, -1.0, ORDER_QTY);
+        }
+        self.ask = None;
+    }
+
+    /// Execute any calibrated fills whose scheduled instant has arrived by `now`.
+    fn settle_scheduled(&mut self, now: i64) {
+        if let Some(o) = self.bid {
+            if o.fill_time <= now {
+                self.fill_bid(o, o.fill_time);
+            }
+        }
+        if let Some(o) = self.ask {
+            if o.fill_time <= now {
+                self.fill_ask(o, o.fill_time);
+            }
+        }
+    }
+
+    /// Naive event-level fill: a real trade trades through our active resting order.
+    fn settle_naive_trade(&mut self, ts: i64, is_buy: bool, px: f64) {
+        if !is_buy {
+            if let Some(o) = self.bid {
+                if ts >= o.active_ts && px <= o.px {
+                    self.fill_bid(o, ts);
+                }
+            }
+        } else if let Some(o) = self.ask {
+            if ts >= o.active_ts && px >= o.px {
+                self.fill_ask(o, ts);
+            }
+        }
+    }
+
+    /// Cancel-replace both quotes from the strategy at decision time `now`.
+    fn requote(&mut self, now: i64) {
+        if self.bid.take().is_some() {
+            self.stats.cancelled_unfilled += 1;
+        }
+        if self.ask.take().is_some() {
+            self.stats.cancelled_unfilled += 1;
+        }
+        let Some(mid0) = self.book.mid() else { return };
+        let eff_mid = if self.cfg.impact {
+            mid0 + self.kernel.impact(now) * TICK_SIZE
+        } else {
+            mid0
+        };
+        let skew = (self.position / MAX_POSITION) * SKEW_TICKS * TICK_SIZE;
+        let half = HALF_SPREAD_TICKS * TICK_SIZE;
+        let active_ts = now + self.latency.entry_ns(now);
+
+        if self.position < MAX_POSITION {
+            let bid_px = ((eff_mid - half - skew) / TICK_SIZE).floor() * TICK_SIZE;
+            if bid_px.is_finite() && bid_px > 0.0 {
+                self.bid = Some(self.make_order(Side::Bid, bid_px, active_ts));
+            }
+        }
+        if self.position > -MAX_POSITION {
+            let ask_px = ((eff_mid + half - skew) / TICK_SIZE).ceil() * TICK_SIZE;
+            if ask_px.is_finite() && ask_px > 0.0 {
+                self.ask = Some(self.make_order(Side::Ask, ask_px, active_ts));
+            }
+        }
+    }
+
+    fn make_order(&mut self, side: Side, px: f64, active_ts: i64) -> Order {
+        let fill_time = if self.cfg.calibrated_fill {
+            let depth = self.book.qty_at_tick(side, self.book.px_to_tick(px));
+            let queue_frac = depth / (depth + ORDER_QTY); // ~1 behind real depth, 0 if empty
+            let p1 = self
+                .fill_model
+                .p_fill(side, FillCriterion::Any, Horizon::S1, queue_frac);
+            schedule_fill_time(active_ts, p1, &mut self.rng)
+        } else {
+            i64::MAX // naive: filled only by a real trade-through
+        };
+        Order { px, active_ts, fill_time }
+    }
+}
+
 fn run(path: &str, cfg: Config, seed: u64, grid_ns: i64) -> Stats {
     let reader = NpzEventReader::open(path).expect("open npz");
-    let mut book = L2Book::new(TICK_SIZE, LOT_SIZE);
-    let fill_model = CalibratedFillModel::new();
-    let mut latency: Box<dyn LatencyModel> = if cfg.calibrated_latency {
+    let latency: Box<dyn LatencyModel> = if cfg.calibrated_latency {
         Box::new(calibrated_race_latency(seed))
     } else {
         Box::new(ConstantLatency::new(NAIVE_LATENCY_NS, NAIVE_LATENCY_NS))
     };
-    let mut kernel = PropagatorKernel::calibrated();
-    let mut rng = Xor64::new(seed ^ 0x9E37_79B9_7F4A_7C15);
+    let mut sim = Sim {
+        cfg,
+        book: L2Book::new(TICK_SIZE, LOT_SIZE),
+        fill_model: CalibratedFillModel::new(),
+        latency,
+        kernel: PropagatorKernel::calibrated(),
+        rng: Xor64::new(seed ^ 0x9E37_79B9_7F4A_7C15),
+        cash: 0.0,
+        position: 0.0,
+        bid: None,
+        ask: None,
+        stats: Stats::default(),
+    };
 
-    let mut cash = 0.0_f64;
-    let mut position = 0.0_f64;
-    let mut bid: Option<Order> = None;
-    let mut ask: Option<Order> = None;
-    let mut stats = Stats::default();
-
-    // Per-interval trade-through extremes for the naive fill rule.
-    let mut min_sell_px = f64::INFINITY;
-    let mut max_buy_px = f64::NEG_INFINITY;
     let mut next_grid = i64::MIN;
     let mut last_mid = f64::NAN;
 
     for ev in reader {
         let ev = ev.expect("read event");
-        let is_local = ev.ev & LOCAL_EVENT != 0;
-        if !is_local {
+        if ev.ev & LOCAL_EVENT == 0 {
             continue;
         }
-        let kind = ev.kind();
         let now = ev.local_ts;
+        let kind = ev.kind();
 
-        // ── settle the just-ended grid interval(s) ───────────────────────────
+        // Calibrated fills are scheduled in continuous time — settle any that are due.
+        if cfg.calibrated_fill {
+            sim.settle_scheduled(now);
+        }
+
+        // Decision grid: cancel-replace quotes when we cross a boundary.
         if next_grid == i64::MIN {
             next_grid = now.div_euclid(grid_ns) * grid_ns + grid_ns;
         }
         while now > next_grid {
-            let t = next_grid;
-            settle_fills(
-                t, &cfg, &fill_model, &mut rng, &mut kernel, &mut bid, &mut ask, &mut position,
-                &mut cash, &mut stats, min_sell_px, max_buy_px,
-            );
-            requote(
-                t, &cfg, &book, &mut latency, &mut kernel, &mut bid, &mut ask, position, &mut stats,
-            );
-            min_sell_px = f64::INFINITY;
-            max_buy_px = f64::NEG_INFINITY;
+            sim.requote(next_grid);
             next_grid += grid_ns;
         }
 
-        // ── apply the event to the book (mirrors bin/replay.rs) ──────────────
         match kind {
             DEPTH_EVENT | DEPTH_SNAPSHOT_EVENT | DEPTH_BBO_EVENT => {
                 let side = if ev.ev & BUY_EVENT != 0 { Side::Bid } else { Side::Ask };
-                book.set_level(side, ev.px, ev.qty, now);
+                sim.book.set_level(side, ev.px, ev.qty, now);
             }
             DEPTH_CLEAR_EVENT => {
                 let has_buy = ev.ev & BUY_EVENT != 0;
                 let has_sell = ev.ev & SELL_EVENT != 0;
                 match (has_buy, has_sell) {
-                    (true, false) => book.clear_side(Side::Bid, Some(ev.px)),
-                    (false, true) => book.clear_side(Side::Ask, Some(ev.px)),
-                    _ => book.clear_all(),
+                    (true, false) => sim.book.clear_side(Side::Bid, Some(ev.px)),
+                    (false, true) => sim.book.clear_side(Side::Ask, Some(ev.px)),
+                    _ => sim.book.clear_all(),
                 }
             }
             TRADE_EVENT => {
-                if ev.ev & BUY_EVENT != 0 {
-                    max_buy_px = max_buy_px.max(ev.px);
-                } else {
-                    min_sell_px = min_sell_px.min(ev.px);
+                let is_buy = ev.ev & BUY_EVENT != 0;
+                if !cfg.calibrated_fill {
+                    sim.settle_naive_trade(now, is_buy, ev.px);
                 }
                 if cfg.calibrated_latency {
-                    latency.on_trigger(now); // a trade is a race trigger (P2.3)
+                    sim.latency.on_trigger(now); // a trade is a race trigger (P2.3)
                 }
             }
             _ => {}
         }
-        if let Some(m) = book.mid() {
+        if let Some(m) = sim.book.mid() {
             last_mid = m;
         }
     }
 
-    let final_mid = last_mid;
-    stats.final_position = position;
-    stats.final_equity = cash + position * final_mid;
-    stats
-}
-
-#[allow(clippy::too_many_arguments)]
-fn settle_fills(
-    now: i64,
-    cfg: &Config,
-    model: &CalibratedFillModel,
-    rng: &mut Xor64,
-    kernel: &mut PropagatorKernel,
-    bid: &mut Option<Order>,
-    ask: &mut Option<Order>,
-    position: &mut f64,
-    cash: &mut f64,
-    stats: &mut Stats,
-    min_sell_px: f64,
-    max_buy_px: f64,
-) {
-    if let Some(o) = *bid {
-        if now >= o.active_ts {
-            let filled = if cfg.calibrated_fill {
-                rng.next_f64() < model.p_fill(Side::Bid, FillCriterion::Any, Horizon::S1, o.queue_frac)
-            } else {
-                min_sell_px <= o.px // naive: a sell traded through our bid
-            };
-            if filled {
-                *position += ORDER_QTY;
-                *cash -= o.px * ORDER_QTY;
-                let fee = MAKER_FEE * o.px * ORDER_QTY;
-                *cash -= fee;
-                stats.fees += fee;
-                stats.fills += 1;
-                stats.buy_fills += 1;
-                if cfg.impact {
-                    kernel.push(now, 1.0, ORDER_QTY);
-                }
-                *bid = None;
-            }
-        }
-    }
-    if let Some(o) = *ask {
-        if now >= o.active_ts {
-            let filled = if cfg.calibrated_fill {
-                rng.next_f64() < model.p_fill(Side::Ask, FillCriterion::Any, Horizon::S1, o.queue_frac)
-            } else {
-                max_buy_px >= o.px // naive: a buy traded through our ask
-            };
-            if filled {
-                *position -= ORDER_QTY;
-                *cash += o.px * ORDER_QTY;
-                let fee = MAKER_FEE * o.px * ORDER_QTY;
-                *cash -= fee;
-                stats.fees += fee;
-                stats.fills += 1;
-                stats.sell_fills += 1;
-                if cfg.impact {
-                    kernel.push(now, -1.0, ORDER_QTY);
-                }
-                *ask = None;
-            }
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn requote(
-    now: i64,
-    cfg: &Config,
-    book: &L2Book,
-    latency: &mut Box<dyn LatencyModel>,
-    kernel: &mut PropagatorKernel,
-    bid: &mut Option<Order>,
-    ask: &mut Option<Order>,
-    position: f64,
-    stats: &mut Stats,
-) {
-    let Some(mid0) = book.mid() else { return };
-    // Impact shifts the price the strategy quotes around (kernel returns ticks).
-    let eff_mid = if cfg.impact { mid0 + kernel.impact(now) * TICK_SIZE } else { mid0 };
-    let skew = (position / MAX_POSITION) * SKEW_TICKS * TICK_SIZE;
-    let half = HALF_SPREAD_TICKS * TICK_SIZE;
-
-    let entry = latency.entry_ns(now);
-    let active_ts = now + entry;
-
-    if position < MAX_POSITION {
-        let bid_px = ((eff_mid - half - skew) / TICK_SIZE).floor() * TICK_SIZE;
-        if bid_px.is_finite() && bid_px > 0.0 {
-            let depth = book.qty_at_tick(Side::Bid, book.px_to_tick(bid_px));
-            let queue_frac = depth / (depth + ORDER_QTY); // ~1 behind real depth, 0 if empty
-            *bid = Some(Order { px: bid_px, active_ts, queue_frac });
-            stats.n_quotes += 1;
-        }
-    } else {
-        *bid = None;
-    }
-    if position > -MAX_POSITION {
-        let ask_px = ((eff_mid + half - skew) / TICK_SIZE).ceil() * TICK_SIZE;
-        if ask_px.is_finite() && ask_px > 0.0 {
-            let depth = book.qty_at_tick(Side::Ask, book.px_to_tick(ask_px));
-            let queue_frac = depth / (depth + ORDER_QTY);
-            *ask = Some(Order { px: ask_px, active_ts, queue_frac });
-            stats.n_quotes += 1;
-        }
-    } else {
-        *ask = None;
-    }
+    sim.stats.final_position = sim.position;
+    sim.stats.final_equity = sim.cash + sim.position * last_mid;
+    sim.stats
 }
 
 fn main() {
@@ -318,24 +342,19 @@ fn main() {
         Config { name: "+fill+latency+impact", calibrated_fill: true, calibrated_latency: true, impact: true },
     ];
 
-    println!("HFT-SimLab P2.5 ablation backtest — {path}");
+    println!("HFT-SimLab P2.5/P2.6 ablation backtest — {path}  (grid={grid_ms}ms, seed={seed})");
     println!("PnL is quote-currency (USDT) mark-to-market: cash + position * last_mid.");
     println!(
-        "{:>22} | {:>7} | {:>7} | {:>7} | {:>12} | {:>8} | {:>8}",
-        "config", "fills", "buys", "sells", "pnl(USDT)", "fees", "end_pos"
+        "{:>22} | {:>7} | {:>7} | {:>7} | {:>12} | {:>8} | {:>8} | {:>9}",
+        "config", "fills", "buys", "sells", "pnl(USDT)", "fees", "end_pos", "cancel"
     );
-    println!("{}", "-".repeat(82));
+    println!("{}", "-".repeat(96));
     for cfg in configs {
         let s = run(path, cfg, seed, grid_ns);
         println!(
-            "{:>22} | {:>7} | {:>7} | {:>7} | {:>12.4} | {:>8.4} | {:>8.4}",
-            cfg.name, s.fills, s.buy_fills, s.sell_fills, s.final_equity, s.fees, s.final_position
+            "{:>22} | {:>7} | {:>7} | {:>7} | {:>12.4} | {:>8.4} | {:>8.4} | {:>9}",
+            cfg.name, s.fills, s.buy_fills, s.sell_fills, s.final_equity, s.fees, s.final_position,
+            s.cancelled_unfilled
         );
     }
-    println!(
-        "\nnote: at a {grid_ms}ms decision grid the calibrated latency layer is a no-op vs +fill —\n\
-         ms-scale entry latency never crosses a 1s boundary, so it cannot change which interval\n\
-         an order becomes fillable in. Latency acts at the sub-second race scale (JOURNAL Entry 7);\n\
-         exposing its PnL effect needs event-level (not grid-level) fill evaluation — a Phase 4 refinement."
-    );
 }
