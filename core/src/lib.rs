@@ -18,7 +18,9 @@
 
 pub mod book;
 pub mod events;
+pub mod latency;
 pub mod npz;
 
 pub use book::{BookState, L2Book, Level, Side};
+pub use latency::{ConstantLatency, LatencyModel, LogNormalLatency, RaceAwareLatency};
 pub use npz::NpzEventReader;
