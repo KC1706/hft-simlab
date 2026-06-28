@@ -58,6 +58,19 @@ def main():
         shutil.copy(src, dest / name)
     print(f"[data] copied train/val.npy -> {dest}")
 
+    # Guarded fix for data packed before the event_type remap: TRADES' type embedding has
+    # 3 slots (0=submission, 1=cancel/delete, 2=execution); raw codes {1,2,3,4} index out of
+    # bounds. Remap in place only if raw codes are present (max > 2), so it's idempotent.
+    import numpy as np
+    for name in ("train.npy", "val.npy"):
+        p = dest / name
+        a = np.load(p)
+        if a[:, 1].max() > 2:  # column 1 = event_type
+            et = a[:, 1].astype(int)
+            a[:, 1] = np.where(et == 1, 0, np.where(et == 4, 2, 1)).astype(a.dtype)
+            np.save(p, a)
+            print(f"[fix] remapped raw event_type {{1,2,3,4}}->{{0,1,1,2}} in {name}")
+
     # DeepMarket uses relative paths ("data/INTC/train.npy", "data/checkpoints/...") so we
     # must run from its repo root regardless of where this driver was launched.
     os.chdir(dm)

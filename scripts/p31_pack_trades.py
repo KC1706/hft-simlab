@@ -37,6 +37,17 @@ mask = pl.fold(acc=pl.lit(True), function=lambda a, s: a & (s != 0),
                exprs=[pl.col(c) for c in level_price_cols])
 df = df.filter(mask)
 
+# TRADES uses a fixed 3-class type embedding (0=submission, 1=cancel/delete, 2=execution).
+# Remap our raw {1=SUB, 2=CANCEL, 3=DELETE, 4=EXEC} -> {0, 1, 1, 2}, mirroring DeepMarket's
+# normalize_messages (event_type-1; replace(2,1); replace(3,2)). Without this the raw codes
+# 3 and 4 index past the 3-slot embedding -> CUDA device-side assert.
+df = df.with_columns(
+    pl.when(pl.col("event_type") == 1).then(0)
+      .when(pl.col("event_type") == 4).then(2)
+      .otherwise(1)  # cancellation (2) and deletion (3) merge into the 'remove' class
+      .alias("event_type")
+)
+
 # Order-feature engineering: inter-arrival time, and depth = |price - mid| in ticks.
 df = df.with_columns(
     (pl.col("time").diff().fill_null(0.0)).alias("dt"),
