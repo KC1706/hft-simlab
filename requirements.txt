@@ -1,0 +1,9 @@
+# HFT-SimLab Python analysis env (uv-managed). Python 3.12.
+# Install:  uv venv && uv pip install -r requirements.txt
+hftbacktest>=2.4      # backtest engine + reference data tooling (P0, parity tests)
+polars>=1.0           # columnar dataframes for the parquet calibration pipeline
+numpy>=1.26
+scipy>=1.11           # log-normal fit (P2.3), stats
+scikit-learn>=1.4     # isotonic regression for the fill model (P2.2)
+matplotlib>=3.8       # figure rendering
+numba>=0.59           # JIT for the stylized-fact hot loops (P1.3)
