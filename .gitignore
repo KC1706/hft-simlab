@@ -1,0 +1,21 @@
+# ── Python ─────────────────────────────────────────────
+.venv/
+__pycache__/
+*.py[cod]
+
+# ── Rust ───────────────────────────────────────────────
+/core/target/
+
+# ── Reference repos (reproducible — see refs/README.md) ─
+/refs/*
+!/refs/README.md
+
+# ── Market data (regenerable from Tardis.dev, see scripts/p0_convert.py) ─
+/data/
+
+# ── Generated intermediate datasets (regenerable from scripts) ─
+/experiments/data/
+
+# ── OS / editor cruft ──────────────────────────────────
+.DS_Store
+*.swp
