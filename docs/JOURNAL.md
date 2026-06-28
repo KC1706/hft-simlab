@@ -1339,7 +1339,7 @@ DataModule, and train on Kaggle free tier; then P3.3 stylized-fact validation.)*
 
 ### P3.2 bring-up — Kaggle debugging log (2026-06-28)
 
-Getting TRADES to *start* training on a Kaggle free GPU took six distinct fixes. None were
+Getting TRADES to *start* training on a Kaggle free GPU took eight distinct fixes. None were
 about the model or the math — all were environment/integration friction, the unglamorous
 80% of making research code run somewhere it wasn't written for. Logged because each carries
 a transferable lesson, and because "it finally trained" hides what it taught.
@@ -1396,6 +1396,34 @@ driver `sys.exit`-ed on missing data — *and* we had piped the command through
 (a) verify the actual mount path of a cloud dataset, don't assume the slug; (b) **never
 filter output while debugging** — `grep` turns a loud, informative failure into a silent one.
 Run raw first, filter only once you know what you're looking at.
+
+**7. The embedding index-out-of-bounds — skipping preprocessing inherits hidden label
+contracts.** Training finally started, then died on the *first step* with a CUDA
+`scatter gather kernel index out of bounds` device-side assert inside `type_embedder`.
+TRADES' type embedding is `nn.Embedding(3, …)` with *fixed* weights — exactly three classes
+(0=submission, 1=cancel/delete, 2=execution). Our exporter wrote raw LOBSTER-style codes
+{1,2,3,4}, and because we set `IS_DATA_PREPROCESSED=True` to feed our own arrays, the model's
+`normalize_messages` (which does `event_type-1; replace(2,1); replace(3,2)` → {0,1,1,2}) never
+ran — so codes 3 and 4 indexed past the embedding. *Fix:* replicate that remap in our packer
+(and a guarded in-place fix in the driver for already-uploaded data). *Lesson:*
+`IS_DATA_PREPROCESSED=True` is a *promise* that your data already satisfies every contract the
+skipped preprocessing would have enforced — including invisible ones like a 3-class label
+encoding baked into a frozen embedding. Bypassing a pipeline means owning all of its
+postconditions. (Debugging aid: a device-side assert reports *asynchronously* and corrupts the
+CUDA context — restart the kernel before retrying, or every later CUDA call lies.)
+
+**8. NaN diffusion loss — the commented-out remedy.** Past the embedding, the first batch loss
+was finite (2.83), then the weights exploded: `after aug: nan` → the loss-aware timestep
+sampler's probability vector went NaN → `np.random.choice: probabilities contain NaN`. The
+cause was an unclipped gradient on our heavier-tailed crypto order sizes; the giveaway was a
+line the authors left commented in their own `run.py`:
+`#gradient_clip_val=5.0 if during training comes out the error "nan" impose gradient clip`.
+*Fix:* monkeypatch `lightning.Trainer` to inject `gradient_clip_val=5.0`, so `run()`'s
+`L.Trainer(...)` picks it up without editing their code. *Lesson:* a commented-out line in
+someone's training script is a landmine they already stepped on — read the trainer/optimizer
+config before the first run; failure modes are often pre-annotated there. And NaN that appears
+*after* a finite first step is almost always an exploding gradient, not bad data — clip first,
+investigate inputs second.
 
 The throughline: every bug was an *interface mismatch* — between our launcher and DeepMarket's
 cwd assumptions, between our probe and its init order, between Lightning's defaults and the
