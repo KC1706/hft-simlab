@@ -1245,3 +1245,94 @@ the Phase-4 fidelity pass.
 
 *(Next entry: P3 — generative counterfactual market: scope the TRADES/diffusion model to
 our crypto L2 format and the Kaggle free-tier training plan.)*
+
+---
+
+## Entry 11 — P3.1: Retargeting TRADES to crypto — the L2→L3 adapter and model scoping (2026-06-28)
+
+### What was done
+Phase 3 begins: a *generative* market that can react to us beyond P2.4's parametric kernel.
+We adopt TRADES (arXiv 2502.07071; official code in `refs/DeepMarket`), a conditional
+diffusion model of order-event streams, and this step retargets it from its native LOBSTER
+equities data to our crypto L2 feed.
+1. **`core/src/bin/lob_export.rs`** — synthesizes an L3-like message stream from our L2
+   deltas and emits it in TRADES-LOB's 50-column layout (6 order features + 40-col top-10
+   book + 4 metrics). Verified on BTCUSDT 2026-05-01.
+2. **`scripts/p31_pack_trades.py`** — normalizes those rows into the `train.npy`/`val.npy`
+   arrays the TRADES `DataModule` consumes (verified: 50k rows → (39992,46)+(9999,46), all
+   finite).
+
+### Theory 11.1 — What TRADES actually is, and why it fits Phase 3
+
+TRADES is a **conditional denoising diffusion** model over order events. Training: take a
+real event vector `x₀ = (time, type, size, price, direction)`, add `t` steps of Gaussian
+noise to get `xₜ`, and train a transformer (the "CDT" — conditional diffusion transformer,
+`refs/DeepMarket/models/diffusers/TRADES/`) to predict the noise, *conditioned* on the
+previous 255 events and the current top-10 book. Generation: start from noise and denoise
+(DDIM, 10 steps) to sample the next event, append it, advance the book, repeat — an
+autoregressive market built one event at a time. This is exactly the Phase-3 ingredient
+PLAN P3 asks for: a market whose next event is drawn from a learned conditional
+distribution, so when we splice in *our* orders the conditioning changes and the market
+*reacts* — the feedback lie (Entry 0, lie #4) that no parametric kernel can capture.
+→ Diffusion background: Ho et al. DDPM (2006.11239), Song et al. DDIM (2010.02502); the
+   LOB-specific architecture is the TRADES paper itself.
+
+### Theory 11.2 — The L2→L3 gap is the whole adaptation problem
+
+TRADES was trained on **L3** LOBSTER data: every order's submission, cancellation, deletion
+and execution with a real `order_id`. Crypto public feeds are **L2** — aggregate quantity
+per price level, no order identity (Entry 0, Theory 0.2). So we cannot *observe* the event
+stream TRADES models; we must **synthesize** it from level deltas: a level quantity increase
+is a SUBMISSION, a decrease a CANCELLATION (DELETION if it empties the level), a trade print
+an EXECUTION (`lob_export.rs`). This is the same latent-L3 inference that motivated the P2.2
+fill model, now used to *manufacture training events* rather than label fills. Its
+honest defects: without order IDs we attribute a decrease to "the level," not to a specific
+queue order, and the cancel-vs-execution split is inferred from event kind (a decrease that
+is really an execution co-located with a trade may be double-counted), so the synthesized
+cancellation rate is an **upper bound**. For *learning a generative distribution* this is
+acceptable — the model learns realistic event dynamics — but it is not a claim of true L3
+ground truth, and the stylized-fact validation of P3.3 is what will tell us whether the
+synthesized stream is realistic enough. This caveat is the headline limitation for the
+paper's honesty box.
+
+### Theory 11.3 — Scoping the model: smaller than you'd think, then deliberately widened
+
+Reading the reference config (`configuration.py`): `AUGMENT_DIM = 64`, `CDT_DEPTH = 8`,
+`CDT_NUM_HEADS = 1`, `CDT_MLP_RATIO = 4`, sequence length 256, 100 diffusion steps. At a
+64-wide embedding and depth 8 the CDT is only **~1–2 M parameters** — far under PLAN P3.1's
+5–15 M budget. The budget is therefore a *capacity headroom* we can spend by widening the
+embedding (64 → 128/256) and/or deepening, which our data justifies: BTCUSDT-perp is far
+denser and more stationary-within-day than the equities sessions TRADES was tuned on
+(26.6 M events/day vs LOBSTER's ~10⁵–10⁶), so a wider model can be fed enough events to
+train without overfitting. The constraint is the *other* direction — Kaggle's free T4
+(16 GB) and 30 GPU-h/week — under which a ~10 M-param CDT with batch 256 and seq 256 trains
+comfortably; inference (DDIM-10) then runs locally on the M2 via MPS. Concrete knob plan for
+P3.2: `AUGMENT_DIM = 128`, `CDT_DEPTH = 10`, everything else at reference, then measure the
+actual parameter count and tune to land in-budget.
+
+### Artifacts & pipeline (verified)
+`lob_export <day>.npz --out rows.csv --max-rows N` → `p31_pack_trades.py rows.csv` →
+`experiments/data/p31/{train,val}.npy` + `stats.json` (means/stds for inverting the
+normalization at generation time). The 50k-row smoke test gives a realistic event mix
+(submission 51%, cancellation 32%, deletion 11%, execution 6%).
+
+### Limitations (for the paper's honesty box)
+- Synthesized L3 (Theory 11.2): cancellation rate is an upper bound; no true queue identity.
+- One contiguous window of one day so far — multi-day/multi-window export is a P3.2 scale-up.
+- Exact parity with TRADES' `normalize_messages` (their inter-arrival and depth conventions)
+  is approximated here; P3.2 wires our arrays through their `DataModule` for bit-parity.
+- Training itself is **not** run here (no GPU); P3.2 runs on Kaggle free tier.
+
+### Manual test for you (P3.1 gate)
+1. `cd hft-simlab/core && cargo build --release --bin lob_export` then
+   `./target/release/lob_export ../data/btcusdt_20260501_0000_0656.npz --out /tmp/rows.csv --max-rows 50000`.
+   Open `/tmp/rows.csv`: 50 columns, and `cut -d, -f2 | sort | uniq -c` shows the 1/2/3/4
+   event-type mix. Convince yourself a level increase became a SUBMISSION (Theory 11.2).
+2. `.venv/bin/python scripts/p31_pack_trades.py /tmp/rows.csv` → check
+   `experiments/data/p31/stats.json` (`n_features` = 46 = 6 order + 40 LOB).
+3. One sentence: why is our synthesized cancellation rate an *upper* bound, not exact?
+   (Answer: a level decrease that is really an execution can be tagged a cancel — Theory 11.2.)
+
+---
+*(Next entry: P3.2 — widen the CDT to ~10 M params, wire our arrays through TRADES'
+DataModule, and train on Kaggle free tier; then P3.3 stylized-fact validation.)*

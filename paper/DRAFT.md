@@ -207,7 +207,28 @@ PnL-prediction error attributable to each component. [Headline number goes here.
   > single resting order per side, and the exponential fill law honours only the one-second
   > calibrated horizon (a memoryless approximation of the multi-horizon isotonic surface of
   > §3.2). Quantitative ablation results appear in §5.
-- 3.6 Generative counterfactual order flow (Phase 3 → here) — [FIG-7]
+- 3.6 Generative counterfactual order flow (Phase 3 → here) — [FIG-7] ◐
+  > **Draft prose (v0, 2026-06-28 — model and data adaptation):**
+  > The parametric impact kernel of §3.4 lets the recorded market respond to the agent's
+  > volume but not to its *presence*: counterparties cannot withdraw or re-quote in reaction
+  > to the agent's orders. To model that final feedback channel we introduce a generative
+  > order-flow model — a conditional denoising diffusion model over order events (TRADES;
+  > Berti et al., arXiv 2502.07071) — that samples each successive market event from a
+  > learned distribution conditioned on the recent event history and the current book, so
+  > that altering the conditioning by inserting the agent's orders changes the simulated
+  > market's subsequent behaviour. A key adaptation is required: the model is formulated for
+  > level-3 message data (per-order submissions, cancellations, deletions and executions),
+  > whereas public cryptocurrency feeds are level-2 (aggregate per-level quantities). We
+  > therefore synthesize a level-3-equivalent event stream from level-2 dynamics — a level
+  > quantity increase is mapped to a submission, a decrease to a cancellation (or deletion if
+  > the level empties), and a trade print to an execution — and pair each synthesized event
+  > with the contemporaneous top-ten book snapshot. Because order identities are unobservable
+  > at level 2, the cancellation-versus-execution attribution is inferred rather than
+  > observed, making the synthesized cancellation rate an upper bound; we treat the realism of
+  > the resulting stream as an empirical question answered by the stylized-fact validation of
+  > §3.7 rather than asserted. The model is scoped to approximately ten million parameters,
+  > trained on free-tier cloud GPUs and run at inference on commodity hardware, keeping the
+  > entire pipeline reproducible at zero cost.
 
 *All figure content, axes, captions, and the raw data each phase must log are fully specified
 in `paper/FIGURES.md` — figures are designed before the data exists.*
