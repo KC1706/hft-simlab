@@ -176,7 +176,38 @@ PnL-prediction error attributable to each component. [Headline number goes here.
   > rolling window and applies the aggregate price shift as an additive offset to the
   > mid-price seen by subsequent strategy logic; fills older than 60 seconds contribute
   > at most G(60)/G(1) = 60^{−0.5} ≈ 13% of their initial impact and are pruned.
-- 3.5 Generative counterfactual order flow (Phase 3 → here) — [FIG-7]
+- 3.5 Composing the stack: the event-level ablation simulator (P2.5–P2.6 → here) ◐
+  > **Draft prose (v0, 2026-06-28 — integration and fill execution):**
+  > The three calibrated components of §§3.2–3.4 are assembled into a single backtest in
+  > which each is independently removable, yielding the ablation lattice evaluated in §5.
+  > A market-making strategy is replayed against the reconstructed book; at each decision
+  > epoch it cancels and re-quotes a passive order per side, and each resting order is
+  > subject to the calibrated fill, latency, and impact models according to the active
+  > configuration. Fills are resolved in **continuous event time** rather than on the
+  > decision grid: when an order is placed it is assigned a fill instant
+  > t_fill = t_active + X, where t_active = t_decision + ℓ is the order's arrival time under
+  > a latency draw ℓ from the model of §3.3, and X is an exponential waiting time whose rate
+  > λ = −ln(1 − p₁) is chosen so that the probability of filling within one second equals the
+  > calibrated fill probability p₁ = P(fill | q, s) of §3.2. An order is executed if its fill
+  > instant precedes its cancellation at the next re-quote; otherwise it is cancelled unfilled.
+  > Under the naive baseline, fills are instead resolved deterministically against the trade
+  > tape — an order fills the instant a print crosses its price — reproducing the touch rule
+  > that defines the fill lie.
+  >
+  > Resolving fills in event time rather than per grid interval is what makes the latency
+  > component observable: because the fill clock is measured from t_active, entry latency
+  > translates one-to-one into a later fill instant, and a latency draw exceeding the
+  > re-quote interval removes the fill entirely. A grid-level fill check, by contrast, is
+  > insensitive to millisecond latency whenever the decision interval exceeds the latency
+  > scale — the effect of the latency component then vanishes by construction, an artifact we
+  > observed and corrected. The construction is exact in the limit of fine decision grids and
+  > degrades gracefully; the marginal PnL contribution of the latency component strengthens
+  > monotonically as the re-quote interval approaches the latency scale. We note two
+  > first-cut approximations, refined in §4's evaluation engine: the strategy maintains a
+  > single resting order per side, and the exponential fill law honours only the one-second
+  > calibrated horizon (a memoryless approximation of the multi-horizon isotonic surface of
+  > §3.2). Quantitative ablation results appear in §5.
+- 3.6 Generative counterfactual order flow (Phase 3 → here) — [FIG-7]
 
 *All figure content, axes, captions, and the raw data each phase must log are fully specified
 in `paper/FIGURES.md` — figures are designed before the data exists.*
