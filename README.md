@@ -27,7 +27,9 @@ learning journal (theory + papers + every design decision, written as the projec
 | **P2.5** | Phase-2 integration: unified ablation backtest `{naive\|+fill\|+latency\|+impact}` | ✅ |
 | **P2.6** | Event-level fills (continuous-time scheduling) — latency layer now measurable | ✅ |
 | **P3.1** | Generative market: L2→TRADES/LOBSTER adapter + model scoping | ✅ |
-| **P3.2–3.4** | Train TRADES on Kaggle, stylized-fact validation, couple to simulator | ⏳ |
+| **P3.2** | Train TRADES on Kaggle (scaffold + driver; ~10M-param model trains) | ◐ |
+| **P3.3** | Stylized-fact validation suite (KS distances, real-vs-real floor verified) | ✅ |
+| **P3.4** | Generate from checkpoint, score realism, couple generator to simulator | ⏳ |
 | **P4** | RL market-maker + the ablation experiment (the headline result) | ⏳ |
 | **P5** | Write-up & open-source release | ⏳ |
 

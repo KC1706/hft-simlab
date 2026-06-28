@@ -1433,3 +1433,59 @@ author's machine encodes a hundred such assumptions; porting it is the work of f
 ---
 *(Next entry: P3.2 results — training curves + the first generated sample; then P3.3
 stylized-fact validation suite.)*
+
+---
+
+## Entry 12 — P3.3: the stylized-fact validation suite (2026-06-28)
+
+### What was done
+Built `scripts/p33_validate.py` — the objective scorer for the generative model. It takes
+two event-row datasets in the `lob_export` schema (the real day, and a TRADES-generated day
+once the P3.2 checkpoint exists) and reports **KS distances** on the microstructure
+fingerprints of Entry 4: per-event spread, standardized event-time mid log-returns (fat
+tails), order/trade size, inter-arrival time, top-10 volume imbalance, plus the |excess
+kurtosis| gap and the trade-sign-ACF power-law-slope gap (long-memory order flow). Validated
+end-to-end before any generated data exists (see below).
+
+### Theory 12.1 — Why KS, and why "not eyeballed" is the whole point
+The PLAN's P3.3 demand is *quantified* validation. A generative market model is easy to make
+look right — overlay two price paths and they're both jagged — and that is exactly how
+unfalsifiable LOB-generation papers happen. The Kolmogorov–Smirnov two-sample statistic is
+the antidote: it is the maximum gap between two empirical CDFs, distribution-free (no
+Gaussianity assumed — essential when every fact here is heavy-tailed), bounded in [0,1], and
+needs no binning choices. One scalar per fact turns "looks realistic" into "spread KS = 0.03,
+size KS = 0.11", a number a reviewer can argue with. The model passes a fact when its KS is
+near the real-vs-real floor and fails when it isn't.
+→ Standard two-sample testing (Kolmogorov–Smirnov); the framing mirrors the *predictive
+   score* TRADES itself reports, but per-stylized-fact rather than aggregate.
+
+### Theory 12.2 — Event-indexed facts dodge the time-grid trap
+Entry 4 computed its facts on a 100 ms grid. The generator emits an *event* stream with its
+own learned inter-arrival times, so forcing both onto a shared wall-clock grid would conflate
+"wrong dynamics" with "wrong clock." This suite instead computes facts in **event time**
+(returns between consecutive events, sign-ACF over event lags), which both streams define
+natively — isolating the question "does the generated event sequence have the right
+statistical structure" from "does it have the right calendar." Inter-arrival realism is then
+scored *separately* as its own KS on `dt`, where it belongs. (Note: event-time tick returns
+on a 1-tick-pinned book are mostly exact zeros with rare ±1 jumps, so their excess kurtosis is
+enormous — ~10³–10⁴ — and is meaningful only as a real-vs-gen *gap*, not an absolute number.)
+
+### Validation — proving the scorer discriminates before trusting it
+A validator you haven't falsified is decoration. Two checks on a 120k-row real slice:
+- **Real vs itself** → every KS = 0.0000 (p = 1), every Δ = 0.000. The floor is exactly zero.
+- **Real vs a deliberately broken "generator"** (sizes ×3, spread +2 ticks) → `spread KS = 0.78`,
+  `size KS = 0.28`, while the untouched facts (`dt`, `imbalance`) stayed at 0.000, and `ret`
+  barely moved (a uniform mid shift leaves returns invariant — a correct non-reaction).
+The suite flags exactly what was broken and nothing else. It is ready to score the real
+generated stream the moment the P3.2 checkpoint produces one (P3.4 generation step).
+
+### Manual test for you (P3.3 gate)
+1. `core/target/release/lob_export data/<day>.npz --out /tmp/real.csv --max-rows 120000`
+2. `.venv/bin/python scripts/p33_validate.py /tmp/real.csv /tmp/real.csv` → all KS = 0 (floor).
+3. Once you have a generated day from the checkpoint:
+   `.venv/bin/python scripts/p33_validate.py /tmp/real.csv /tmp/generated.csv` — read the KS
+   column: facts near 0 are reproduced, facts ≫ 0 are where the model needs work.
+
+---
+*(Next entry: P3.4 — generate a day from the trained checkpoint, de-normalize with the
+p31 stats, score it through this suite, then couple the generator into the simulator.)*

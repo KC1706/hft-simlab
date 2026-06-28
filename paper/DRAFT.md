@@ -229,6 +229,21 @@ PnL-prediction error attributable to each component. [Headline number goes here.
   > §3.7 rather than asserted. The model is scoped to approximately ten million parameters,
   > trained on free-tier cloud GPUs and run at inference on commodity hardware, keeping the
   > entire pipeline reproducible at zero cost.
+- 3.7 Stylized-fact validation of the generative model — [FIG-7] ◐
+  > **Draft prose (v0, 2026-06-28 — quantitative realism scoring):**
+  > Generative market models are easily made to *appear* realistic, so we hold ours to a
+  > quantitative standard: a generated event stream is scored against held-out real data by
+  > the two-sample Kolmogorov–Smirnov distance on each microstructure stylized fact —
+  > per-event spread, standardized event-time mid-return (heavy tails), order size,
+  > inter-arrival time, and top-of-book volume imbalance — together with the gap in excess
+  > kurtosis and in the power-law slope of the trade-sign autocorrelation (long-memory order
+  > flow). The KS statistic is distribution-free and binning-free, which matters because every
+  > fact here is heavy-tailed; it reduces "looks realistic" to a per-fact number bounded in
+  > [0,1] with an interpretable floor (real-vs-real ≈ 0). Facts are measured in event time
+  > rather than on a wall-clock grid, so the realism of the sequence is assessed separately
+  > from the realism of the inter-arrival clock (itself scored as the dt distance). A model is
+  > deemed to reproduce a stylized fact when its KS is near that floor; the per-fact table is
+  > the generative model's realism scorecard.
 
 *All figure content, axes, captions, and the raw data each phase must log are fully specified
 in `paper/FIGURES.md` — figures are designed before the data exists.*
