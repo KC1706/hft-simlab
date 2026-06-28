@@ -18,6 +18,7 @@ Usage on Kaggle (GPU on):
         --data experiments/data/p31 [--smoke] [--augment-dim 128] [--depth 10] [--epochs 50]
 """
 import argparse
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -51,6 +52,10 @@ def main():
         shutil.copy(src, dest / name)
     print(f"[data] copied train/val.npy -> {dest}")
 
+    # DeepMarket uses relative paths ("data/INTC/train.npy", "data/checkpoints/...") so we
+    # must run from its repo root regardless of where this driver was launched.
+    os.chdir(dm)
+
     # 2) Import DeepMarket and configure for our data + a from-scratch TRADES run.
     import constants as cst
     import configuration
@@ -80,6 +85,7 @@ def main():
         for p in cst.LearningHyperParameter:
             if p.value in fixed:
                 config.HYPER_PARAMETERS[p] = fixed[p.value]
+        config.FILENAME_CKPT = "PROBE"  # run() sets this; the probe runs before run()
         from models.diffusers.diffusion_engine import DiffusionEngine
         model = DiffusionEngine(config)
         n_params = sum(p.numel() for p in model.parameters())
