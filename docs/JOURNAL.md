@@ -1163,3 +1163,73 @@ measures the **fill** and **impact** layers; latency awaits finer time resolutio
 
 ---
 *(Next entry: P2.6 — event-level fill/latency refinement, then Phase 3 generative market planning.)*
+
+---
+
+## Entry 10 — P2.6: event-level fills make latency measurable (2026-06-28)
+
+### What was done
+Rewrote the backtest fill engine (`core/src/bin/backtest.rs`) from grid-boundary
+evaluation to **continuous-time scheduling**, the fix for Entry 9's latency null result.
+- **Calibrated path:** when a quote is placed, draw its fill instant
+  `fill_time = active_ts + Exp(λ)`, where `λ = −ln(1 − P₁ₛ)` per second so that the
+  probability of filling within 1 s equals the calibrated `P(fill | queue_frac)` (P2.2).
+  At each event we settle any order whose `fill_time` has arrived.
+- **Naive path:** fills now match the *real* trade stream at event time — a sell trade at
+  `≤ bid_px` (or buy at `≥ ask_px`) fills the order the instant it prints, gated by
+  `ts ≥ active_ts`.
+- A `cancel` counter reports cancel-replace churn (orders requoted away before filling).
+
+### Theory 10.1 — Why measuring fill time from `active_ts` resurrects latency
+
+Entry 9's engine asked "did it fill in this 1 s bucket?", and a 4 ms entry latency never
+moved an order out of its bucket — latency washed out. The continuous engine measures the
+fill clock **from `active_ts = decision + entry_latency`**, so latency translates one-to-one
+into a later fill instant. If that instant slips past the next requote, the order is
+cancelled unfilled. Now latency does exactly what it does in life: it eats the front of
+your order's exposure window. The effect strengthens monotonically as the decision grid
+tightens (at a 100 ms grid a 137 ms latency-tail draw can consume the *entire* window), which
+is the right qualitative behaviour — latency bites hardest for the fastest-requoting
+strategies. → Reality-Gap paper (arXiv 2603.24137 §4): latency is a timing phenomenon, and a
+simulator only sees it if its fill resolution is finer than the latency itself.
+
+### Theory 10.2 — The memoryless approximation, stated honestly
+
+The isotonic curves give *cumulative* `P(fill ≤ τ)` at τ ∈ {1, 10, 60}s; the engine uses
+only the 1 s point and assumes the waiting time is Exponential (constant hazard). That is a
+**memoryless approximation**: real fill hazard is not constant — it spikes when trades
+cluster (vol clustering, Entry 4) and decays as your queue empties. Matching the 1 s mass
+keeps short-horizon behaviour calibrated; the 10 s/60 s curvature is discarded. A
+piecewise-constant hazard honouring all three horizons is a cheap future refinement
+(scheduled for Phase 4 alongside true queue-position tracking). Logged so the assumption is
+visible to a reviewer rather than buried in `schedule_fill_time()`.
+
+### Results — latency is no longer a no-op (BTCUSDT 2026-05-01, seed 42)
+
+| grid | config | fills | PnL (USDT) | fees |
+|---|---|---|---|---|
+| 1000 ms | +fill | 3,469 | −28.63 | 53.30 |
+| 1000 ms | +fill+latency | 3,600 | **−34.56** | 55.32 |
+| 1000 ms | +fill+latency+impact | 3,646 | −32.76 | 56.02 |
+| 100 ms | +fill | 4,032 | −36.89 | 61.96 |
+| 100 ms | +fill+latency | 4,281 | −36.28 | 65.78 |
+
+The `+latency` row now diverges from `+fill` at every grid. The sign is instructive: the
+realistic latency distribution (median 4 ms, Entry 7) is on average *faster* than the
+conservative 10 ms naive constant, so it fills slightly **more** — but its heavy tail and
+race jitter land those extra fills at worse moments, and PnL **falls** (−28.6 → −34.6 at 1 s).
+That is the latency lie made quantitative: a constant-latency backtest both mis-states fill
+count and flatters PnL by erasing the tail/race timing that does the damage.
+
+### Manual test for you (P2.6 gate)
+1. `cd hft-simlab/core && cargo test` — still 32 green (engine change is in the binary;
+   the `fill::` contract is unchanged).
+2. `./target/release/backtest ../data/btcusdt_20260501_0000_0656.npz --grid-ms 1000` then
+   `--grid-ms 100`. Confirm `+fill+latency` ≠ `+fill` in both, and that the gap widens as
+   the grid tightens (Theory 10.1).
+3. One sentence: why does a *faster*-on-average latency model still lose more money than the
+   slower constant baseline? (Answer: tail + race timing — Theory 10.1 / Results.)
+
+---
+*(Next entry: P3 — generative counterfactual market: scope the TRADES/diffusion model to
+our crypto L2 format and the Kaggle free-tier training plan.)*

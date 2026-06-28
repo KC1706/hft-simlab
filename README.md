@@ -25,6 +25,7 @@ learning journal (theory + papers + every design decision, written as the projec
 | **P2.3** | Calibrated latency model with race dynamics (log-normal + race-aware jitter) | ✅ |
 | **P2.4** | Market-impact feedback kernel (Bouchaud propagator, square-root law) | ✅ |
 | **P2.5** | Phase-2 integration: unified ablation backtest `{naive\|+fill\|+latency\|+impact}` | ✅ |
+| **P2.6** | Event-level fills (continuous-time scheduling) — latency layer now measurable | ✅ |
 | **P3** | Generative counterfactual market (TRADES/diffusion, Kaggle GPU) | ⏳ |
 | **P4** | RL market-maker + the ablation experiment (the headline result) | ⏳ |
 | **P5** | Write-up & open-source release | ⏳ |
