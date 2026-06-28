@@ -40,6 +40,8 @@ def main():
     ap.add_argument("--batch-size", type=int, default=256)
     ap.add_argument("--smoke", action="store_true", help="tiny wiring test (depth 1, 1 epoch)")
     ap.add_argument("--count-only", action="store_true", help="print param count for the given dims and exit")
+    ap.add_argument("--grad-clip", type=float, default=5.0,
+                    help="gradient-norm clip (DeepMarket's own remedy for NaN diffusion loss; 0=off)")
     args = ap.parse_args()
 
     dm = Path(args.deepmarket).resolve()
@@ -118,6 +120,18 @@ def main():
     if args.count_only:
         print("[count-only] exiting before training.")
         return
+
+    # Inject gradient clipping: run() builds the Trainer without it, but DeepMarket's own
+    # comment says NaN diffusion loss needs `gradient_clip_val`. Patch lightning.Trainer so
+    # run()'s `L.Trainer(...)` call (attribute lookup at call time) picks up the clip value.
+    if args.grad_clip and not args.count_only:
+        import lightning as L
+        _OrigTrainer = L.Trainer
+        def _ClippedTrainer(*a, **k):
+            k.setdefault("gradient_clip_val", args.grad_clip)
+            return _OrigTrainer(*a, **k)
+        L.Trainer = _ClippedTrainer
+        print(f"[train] gradient_clip_val={args.grad_clip} (anti-NaN)")
 
     # 4) Train. run() builds the Lightning Trainer (EarlyStopping on val_ema_loss) and fits.
     accelerator = "gpu" if cst.DEVICE.startswith("cuda") else "cpu"
