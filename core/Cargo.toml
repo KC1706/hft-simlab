@@ -1,0 +1,19 @@
+[package]
+name = "lob-core"
+version = "0.1.0"
+edition = "2021"
+description = "HFT-SimLab Phase 1: minimal L2 order book built from scratch (PLAN.md P1.1)"
+license = "MIT"
+
+[lib]
+name = "lob_core"
+path = "src/lib.rs"
+
+# P1.1 had zero deps on purpose. P1.2 adds exactly one: raw-deflate decompression
+# for streaming the .npz (we parse the zip + npy containers ourselves).
+[dependencies]
+flate2 = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
