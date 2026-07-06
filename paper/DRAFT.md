@@ -229,6 +229,21 @@ PnL-prediction error attributable to each component. [Headline number goes here.
   > §3.7 rather than asserted. The model is scoped to approximately ten million parameters,
   > trained on free-tier cloud GPUs and run at inference on commodity hardware, keeping the
   > entire pipeline reproducible at zero cost.
+  >
+  > **Draft prose (v1 addendum, 2026-06-29 — normalization and its inverse):** Training
+  > operates on a per-feature standardized representation: each continuous order and book
+  > feature is centred and scaled to zero mean and unit variance, while the categorical event
+  > type and side are left in their native encoding. Because standardization is affine it is
+  > exactly invertible from the stored per-feature means and standard deviations, and we
+  > recover real-unit events by applying that inverse; we verify the inversion by a round-trip
+  > on held-out data, which reproduces the original to floating-point precision. The four
+  > convenience observables — mid-price, spread, top-of-book imbalance and volume-weighted
+  > average price — are not de-normalized as independent quantities but recomputed from the
+  > recovered book by the identical arithmetic used to construct the real data, guaranteeing
+  > internal consistency and ensuring any divergence measured in §3.7 reflects book geometry
+  > rather than a mismatch in metric definitions. Event timestamps are reconstructed by
+  > cumulating the generated inter-arrival times; since every stylized fact is computed from
+  > first differences, the unobserved absolute time origin is immaterial.
 - 3.7 Stylized-fact validation of the generative model — [FIG-7] ◐
   > **Draft prose (v0, 2026-06-28 — quantitative realism scoring):**
   > Generative market models are easily made to *appear* realistic, so we hold ours to a

@@ -1489,3 +1489,108 @@ generated stream the moment the P3.2 checkpoint produces one (P3.4 generation st
 ---
 *(Next entry: P3.4 — generate a day from the trained checkpoint, de-normalize with the
 p31 stats, score it through this suite, then couple the generator into the simulator.)*
+
+---
+
+## Entry 13 — P3.4 (step 1): de-normalization, the deterministic inverse (2026-06-29)
+
+### Where the project actually stands (the honest status)
+Phases 0–2 are complete (our book, replay, calibrated fills/latency/impact, the event-level
+ablation simulator). Phase 3 is mid-stream: P3.1 (the L2→TRADES exporter + packer) and P3.3
+(the KS validation suite) are done, and the P3.2 *training driver* is written and debugged
+through eight bring-up fixes (Entry 11). The one thing P3.2 still needs is the run itself —
+the Kaggle GPU job that produces a checkpoint. That is a human-in-the-loop step (no local GPU
+per the budget rules), and **it is the single blocker on the rest of Phase 3**: there is no
+`INTC_*.ckpt` anywhere yet, and the `ks_report.json` currently on disk is the Entry-12
+self-falsification (real vs a *deliberately broken* generator), not a real generation.
+
+So rather than write more code that can only run after the checkpoint exists, this entry
+builds the piece of P3.4 that is **fully implementable and verifiable today, with no GPU and
+no checkpoint**: the de-normalization inverse. P3.4 has two halves — (a) turn the model's
+normalized output back into a real-units order/book stream and score it, and (b) roll the book
+forward autoregressively and couple it into the simulator. Half (a) splits again into the
+GPU-gated *sampling* and the GPU-free *inversion*; the inversion is deterministic, so it can be
+written and proven now, removing a whole class of risk from the eventual generation run.
+
+### What was done
+`scripts/p34_denorm.py` — the exact inverse of `scripts/p31_pack_trades.py`. It takes a
+generated array in p31's normalized 46-column layout (`[dt, event_type, size, price,
+direction, depth]` + 40 LOB columns), and:
+1. **de-normalizes** the z-scored columns using the `mean`/`std` arrays in
+   `experiments/data/p31/stats.json` — the file p31 deliberately kept for exactly this moment
+   (Entry 11) — while leaving the categorical columns (`event_type`, `direction`) untouched
+   because p31 never scaled them;
+2. **reconstructs wall-clock time** as `cumsum(dt)`;
+3. **recomputes** mid / spread / imbalance / vwap from the de-normalized top-10 book using the
+   *same formulas* as `core/src/bin/lob_export.rs` (byte-for-byte: imbalance is `bid_vol /
+   (bid_vol + ask_vol)`, vwap is size-weighted over all 20 quotes);
+4. **writes** a CSV in the lob_export schema, so `p33_validate.py` consumes it with no
+   special-casing — the generate→score path is then two commands.
+
+### Theory 13.1 — Why de-normalization is its own step, and why z-scoring is invertible
+A neural net trains far better on inputs centred at 0 with unit variance — gradients stay
+well-scaled across features whose natural units differ by orders of magnitude (inter-arrival
+times in milliseconds, prices in tens of thousands of ticks, sizes in fractional BTC). p31
+achieves that with a per-column **z-score**, `x' = (x − μ)/σ`. The crucial property is that
+this map is **affine and therefore exactly invertible**: `x = x'·σ + μ`, provided you kept μ
+and σ. That "provided" is the whole reason p31 wrote `stats.json` instead of throwing the
+constants away — normalization without saved statistics is a one-way door. Verified here: the
+round-trip `de-normalize → re-normalize` on the 200k-row held-out array returns the original to
+**1.2 × 10⁻¹³** (float64 round-off), i.e. the inverse is exact. Categorical columns are left
+alone because they were never scaled; quantizing them (`event_type ∈ {0,1,2}`, `direction ∈
+{−1,+1}`) is a *rounding* of the model's continuous output, a separate operation from undoing
+a z-score, and it belongs to the sampling step's reconstruction, not here.
+
+### Theory 13.2 — Derive the book metrics, don't trust them
+The model is trained to generate *order events*; mid, spread, imbalance and vwap are not
+independent quantities it should be free to invent — they are deterministic **functions of the
+book**. So p34 recomputes them from the de-normalized levels rather than de-normalizing the
+metric columns directly. This enforces internal consistency (a generated spread can never
+disagree with its own best bid/ask) and means the validator scores genuine book geometry, not
+a number the model happened to emit. It also mirrors how the real data was built — lob_export
+*computes* these same four metrics from the book — so the real and generated CSVs are produced
+by identical arithmetic, and any KS gap is signal about the book, not an artefact of two
+different metric definitions. This is the microstructure point from Bouchaud *Trades, Quotes &
+Prices* (the chapters on the order book and on impact): the observables are functions of the
+queue state; model the state, read the observables off it.
+
+### Theory 13.3 — Event time has no origin, and that is fine
+p34 rebuilds `time` as the cumulative sum of inter-arrivals, which fixes the *spacing* of
+events but not an absolute start — the warm-up rows p31 dropped mean the recovered clock is
+shifted from the original. This costs nothing: every stylized fact in the suite is computed
+from **differences** — `dt = diff(time)` and `ret = diff(log mid)` — so a constant offset
+cancels (Entry 12's event-time argument). The inter-arrival *distribution* is preserved
+exactly by the inversion; the absolute timestamp is a free gauge we never read.
+
+### What still needs the checkpoint (so the next session knows exactly where to start)
+The GPU-gated half: DeepMarket generates by calling `DiffusionEngine.sample(cond_orders=…,
+x=…, cond_lob=…)` (it denoises a masked future order block conditioned on a window of past
+orders + the book). Two subtleties make this more than a thin wrapper, and both are already
+solved inside DeepMarket's ABIDES *WorldAgent* post-processing — read that before reinventing
+it: (i) `type_embedding` turns the 3-class `event_type` into a learned vector before diffusion,
+so the generated output lives in the embedded space and the discrete class must be **recovered**
+(nearest-embedding / inverse map), and (ii) producing a *self-consistent* book stream needs the
+generated order to be applied to the book and the next condition window to use the rolled-forward
+state — the autoregressive loop that is also half (b), the simulator coupling. The first-pass
+validation can sidestep (ii) by pairing each generated order with its *real* conditioning book
+snapshot (then spread/imbalance/ret are scored against real, and the order-flow facts — size,
+dt, trade-sign ACF — are the meaningful test); the honest, fully-counterfactual book comes only
+with the autoregressive coupling. p34 already accepts that 46-column "generated orders + book"
+array, so it is ready for either path.
+
+### Manual test for you (P3.4 step-1 gate — runs now, no checkpoint needed)
+1. `.venv/bin/python scripts/p34_denorm.py --self-test`
+   → expect `round-trip max |renorm − original| ≈ 1e-13 (PASS)`, `spread min ≥ 0`,
+   `event_type classes ⊆ {0,1,2}`, and a CSV written to `/tmp/p34_selftest.csv`.
+2. `.venv/bin/python scripts/p33_validate.py /tmp/p34_selftest.csv /tmp/p34_selftest.csv`
+   → every KS = 0.0000 (p = 1): proves the reconstructed CSV is byte-compatible with the
+   validator, so the eventual generated stream will score with no plumbing changes.
+3. *(Once you run P3.2 on Kaggle and download the checkpoint)* generate the array, then:
+   `.venv/bin/python scripts/p34_denorm.py /tmp/generated.npy --out /tmp/generated.csv` and
+   `.venv/bin/python scripts/p33_validate.py /tmp/real.csv /tmp/generated.csv` — the KS column
+   is the generative model's report card.
+
+---
+*(Next entry: P3.4 step 2 — the GPU sampling wrapper around `DiffusionEngine.sample` with
+type de-embedding (after the Kaggle checkpoint exists), then the autoregressive book-rolling
+coupling into the Rust simulator.)*
