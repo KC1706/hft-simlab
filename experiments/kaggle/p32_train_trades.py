@@ -42,7 +42,32 @@ def main():
     ap.add_argument("--count-only", action="store_true", help="print param count for the given dims and exit")
     ap.add_argument("--grad-clip", type=float, default=5.0,
                     help="gradient-norm clip (DeepMarket's own remedy for NaN diffusion loss; 0=off)")
+    # --- Throughput / early-stop controls (added after the 2026-07-19 run: each epoch cost
+    #     ~2.5h because validation = 100 diffusion-sampling batches x2/epoch (~35min each),
+    #     and EarlyStopping(patience=6, checked twice/epoch) killed it at epoch 0. See
+    #     docs/JOURNAL.md P3.2 debugging log. These knobs make validation cheap and give the
+    #     model room to actually learn.) ---
+    ap.add_argument("--val-batches", type=int, default=20,
+                    help="cap validation batches per check (Trainer limit_val_batches); val is the wall-clock bottleneck")
+    ap.add_argument("--val-every", type=float, default=1.0,
+                    help="validation frequency (Trainer val_check_interval); 1.0 = once per epoch (run.py default is 0.5 = twice)")
+    ap.add_argument("--patience", type=int, default=15,
+                    help="EarlyStopping patience override (run.py hardcodes 6, far too tight for noisy diffusion val)")
+    ap.add_argument("--limit-train-batches", type=int, default=0,
+                    help="cap training steps per epoch (0 = full ~3124); used by --probe to make epochs fast")
+    ap.add_argument("--probe", action="store_true",
+                    help="fast diagnostic run: 6 epochs, capped train/val batches, early-stop OFF — confirms loss actually decreases before committing a full ~9h session")
     args = ap.parse_args()
+
+    # --probe presets (only fill values the user did not override on the CLI).
+    if args.probe:
+        if args.epochs == 50:
+            args.epochs = 6
+        if args.limit_train_batches == 0:
+            args.limit_train_batches = 600      # ~3.5 min/epoch at ~2.8 it/s vs ~90 min full
+        if args.val_batches == 20:
+            args.val_batches = 10               # ~4 min/val vs ~35 min at 100
+        args.patience = 10 ** 6                 # never early-stop during a probe; we read the trend
 
     dm = Path(args.deepmarket).resolve()
     if not (dm / "run.py").exists():
@@ -121,17 +146,33 @@ def main():
         print("[count-only] exiting before training.")
         return
 
-    # Inject gradient clipping: run() builds the Trainer without it, but DeepMarket's own
-    # comment says NaN diffusion loss needs `gradient_clip_val`. Patch lightning.Trainer so
-    # run()'s `L.Trainer(...)` call (attribute lookup at call time) picks up the clip value.
-    if args.grad_clip and not args.count_only:
+    # Patch lightning.Trainer so run()'s `L.Trainer(...)` call (attribute lookup at call time)
+    # picks up our overrides. run() builds the Trainer with values we must change:
+    #   * gradient_clip_val — DeepMarket's own remedy for NaN diffusion loss (absent in run.py)
+    #   * val_check_interval=0.5 and 100 val batches — the wall-clock killer (~35min x2/epoch)
+    #   * EarlyStopping(patience=6) — too tight; killed the 2026-07-19 run at epoch 0
+    # setdefault can't override keys run.py already passes, so for those we assign directly.
+    if not args.count_only:
         import lightning as L
+        from lightning.pytorch.callbacks.early_stopping import EarlyStopping
         _OrigTrainer = L.Trainer
-        def _ClippedTrainer(*a, **k):
-            k.setdefault("gradient_clip_val", args.grad_clip)
+
+        def _PatchedTrainer(*a, **k):
+            if args.grad_clip:
+                k.setdefault("gradient_clip_val", args.grad_clip)
+            k["val_check_interval"] = args.val_every          # override run.py's 0.5
+            k["limit_val_batches"] = args.val_batches         # cap the expensive sampling val
+            if args.limit_train_batches:
+                k["limit_train_batches"] = args.limit_train_batches
+            for cb in (k.get("callbacks") or []):             # relax EarlyStopping in place
+                if isinstance(cb, EarlyStopping):
+                    cb.patience = args.patience
             return _OrigTrainer(*a, **k)
-        L.Trainer = _ClippedTrainer
-        print(f"[train] gradient_clip_val={args.grad_clip} (anti-NaN)")
+
+        L.Trainer = _PatchedTrainer
+        print(f"[train] overrides: grad_clip={args.grad_clip} val_every={args.val_every} "
+              f"val_batches={args.val_batches} patience={args.patience} "
+              f"limit_train_batches={args.limit_train_batches or 'full'}")
 
     # 4) Train. run() builds the Lightning Trainer (EarlyStopping on val_ema_loss) and fits.
     accelerator = "gpu" if cst.DEVICE.startswith("cuda") else "cpu"
