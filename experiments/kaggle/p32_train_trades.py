@@ -57,6 +57,14 @@ def main():
                     help="cap training steps per epoch (0 = full ~3124); used by --probe to make epochs fast")
     ap.add_argument("--probe", action="store_true",
                     help="fast diagnostic run: 6 epochs, capped train/val batches, early-stop OFF — confirms loss actually decreases before committing a full ~9h session")
+    # --- Learning-rate overrides (added after the first probe showed the model NOT learning:
+    #     val_loss_simple pinned at 2.74, train loss rising 2.77->3.6. DeepMarket's base LR is
+    #     0.001 and its type-embedder param-group is hardcoded to lr=0.01 (diffusion_engine.py
+    #     line 248) which the scheduler never decays — both too hot for our 10M model.) ---
+    ap.add_argument("--lr", type=float, default=0.0,
+                    help="override base learning rate (0 = DeepMarket default 0.001)")
+    ap.add_argument("--embed-lr", type=float, default=0.0,
+                    help="override the type-embedder param-group LR (0 = DeepMarket default 0.01, hardcoded and never decayed)")
     args = ap.parse_args()
 
     # --probe presets (only fill values the user did not override on the CLI).
@@ -115,6 +123,23 @@ def main():
     fixed[LHP.CDT_DEPTH.value] = 1 if args.smoke else args.depth
     fixed[LHP.BATCH_SIZE.value] = 16 if args.smoke else args.batch_size
     fixed[LHP.EPOCHS.value] = 1 if args.smoke else args.epochs
+    if args.lr:                                  # base LR (diffuser param group)
+        fixed[LHP.LEARNING_RATE.value] = args.lr
+
+    # Override the hardcoded type-embedder LR (diffusion_engine.py:248 sets it to 0.01 in a
+    # separate Adam param group the scheduler never touches). We can't edit refs/, so patch
+    # configure_optimizers at runtime to reset that group's lr after the optimizer is built.
+    if args.embed_lr:
+        from models.diffusers.diffusion_engine import DiffusionEngine as _DE
+        _orig_cfg = _DE.configure_optimizers
+        def _cfg_with_embed_lr(self):
+            opt = _orig_cfg(self)
+            # Adam path builds [diffuser, type_embedder]; the embedder group is the one
+            # carrying an explicit per-group 'lr'. Reset every non-base group to be safe.
+            for g in self.optimizer.param_groups[1:]:
+                g["lr"] = args.embed_lr
+            return opt
+        _DE.configure_optimizers = _cfg_with_embed_lr
 
     config = configuration.Configuration()
     config.CHOSEN_MODEL = cst.Models.TRADES
@@ -172,7 +197,8 @@ def main():
         L.Trainer = _PatchedTrainer
         print(f"[train] overrides: grad_clip={args.grad_clip} val_every={args.val_every} "
               f"val_batches={args.val_batches} patience={args.patience} "
-              f"limit_train_batches={args.limit_train_batches or 'full'}")
+              f"limit_train_batches={args.limit_train_batches or 'full'} "
+              f"lr={args.lr or 'default(0.001)'} embed_lr={args.embed_lr or 'default(0.01)'}")
 
     # 4) Train. run() builds the Lightning Trainer (EarlyStopping on val_ema_loss) and fits.
     accelerator = "gpu" if cst.DEVICE.startswith("cuda") else "cpu"
