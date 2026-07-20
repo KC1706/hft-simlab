@@ -1688,3 +1688,20 @@ is not the lever — the ~50% negative-size fraction is a *representation* probl
 modelled on a positive support, e.g. log-size), and the trivially-matched book facts only become
 real tests under the autoregressive coupling. Those two — not longer training — are the next
 moves.
+
+### Addendum 2 (2026-07-21) — log-size fix: size KS 0.43 → 0.089, negatives eliminated
+Acting on Entry 14's diagnosis (the ~50% negative sizes are a *representation* flaw, not a
+training one), log-transformed `size` and `dt` before z-scoring in `p31_pack_trades.py` and
+inverted with `exp()` in `p34_denorm.py` (stats.json records `log_cols`/`log_floor`). Because
+`exp()` is strictly positive, negative sizes/dt become impossible. Re-packed (1M rows), retrained
+config A 5 epochs on the log data (kernel hft-p32-log, dataset hft-p31log), regenerated 3000
+orders (hft-p35-gen-log), scored. Result: **KS(size) 0.426 → 0.089** (now under the 0.1 "passes"
+bar; ~2× the measured real-vs-real floor of 0.041) and **negative sizes 50.4% → 0.0%**. This is
+the clean confirmation that representation, not epochs, was the lever — one transform beat 15
+extra epochs. KS(dt) 0.522 → 0.539 (unchanged): dt's problem is not positivity but shape — a
+large mass of simultaneous events (dt≈0, clamped to the log floor → an outlier spike) plus bursty
+power-law arrivals; log alone doesn't fix it. Next dt ideas: model dt on a better support (e.g.
+handle the dt=0 mass explicitly, or a hurdle/mixture), and the autoregressive coupling for the
+book facts. NOTE: p35_generate's internal `neg_size` counter now reports pre-exp normalized-space
+negatives (~50%) and is misleading for log data; the true post-exp negative fraction is 0%
+(verified on the denormalized CSV).
