@@ -65,6 +65,10 @@ def main():
                     help="override base learning rate (0 = DeepMarket default 0.001)")
     ap.add_argument("--embed-lr", type=float, default=0.0,
                     help="override the type-embedder param-group LR (0 = DeepMarket default 0.01, hardcoded and never decayed)")
+    ap.add_argument("--resume", default="",
+                    help="path to a .ckpt to continue training from (Lightning ckpt_path resume: "
+                         "restores weights + optimizer + epoch counter). --epochs is the ABSOLUTE "
+                         "target, so to add N epochs to a ckpt at epoch=E set --epochs E+1+N.")
     args = ap.parse_args()
 
     # --probe presets (only fill values the user did not override on the CLI).
@@ -182,6 +186,14 @@ def main():
         from lightning.pytorch.callbacks.early_stopping import EarlyStopping
         _OrigTrainer = L.Trainer
 
+        if args.resume:  # PyTorch>=2.6 weights_only=True can't unpickle the config in the ckpt
+            import torch as _torch
+            _orig_load = _torch.load
+            def _full_load(*la, **lk):
+                lk["weights_only"] = False
+                return _orig_load(*la, **lk)
+            _torch.load = _full_load
+
         def _PatchedTrainer(*a, **k):
             if args.grad_clip:
                 k.setdefault("gradient_clip_val", args.grad_clip)
@@ -192,13 +204,22 @@ def main():
             for cb in (k.get("callbacks") or []):             # relax EarlyStopping in place
                 if isinstance(cb, EarlyStopping):
                     cb.patience = args.patience
-            return _OrigTrainer(*a, **k)
+            trainer = _OrigTrainer(*a, **k)
+            if args.resume:                                   # inject ckpt_path into run()'s fit()
+                _orig_fit = trainer.fit
+                def _fit_resume(*fa, **fk):
+                    fk.setdefault("ckpt_path", args.resume)
+                    print(f"[train] resuming from {args.resume}", flush=True)
+                    return _orig_fit(*fa, **fk)
+                trainer.fit = _fit_resume
+            return trainer
 
         L.Trainer = _PatchedTrainer
         print(f"[train] overrides: grad_clip={args.grad_clip} val_every={args.val_every} "
               f"val_batches={args.val_batches} patience={args.patience} "
               f"limit_train_batches={args.limit_train_batches or 'full'} "
-              f"lr={args.lr or 'default(0.001)'} embed_lr={args.embed_lr or 'default(0.01)'}")
+              f"lr={args.lr or 'default(0.001)'} embed_lr={args.embed_lr or 'default(0.01)'} "
+              f"resume={args.resume or 'no'}")
 
     # 4) Train. run() builds the Lightning Trainer (EarlyStopping on val_ema_loss) and fits.
     accelerator = "gpu" if cst.DEVICE.startswith("cuda") else "cpu"
