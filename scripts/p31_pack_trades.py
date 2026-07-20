@@ -48,6 +48,34 @@ df = df.with_columns(
       .alias("event_type")
 )
 
+# --- Event-time spreading (L2->L3 timing reconstruction) ---------------------------------
+# Our data is L2 snapshots: each exchange update at time T unpacks into MANY events (mean ~21,
+# up to ~1266) all stamped with the same T, so raw inter-arrival dt is ~95% exact zeros -- a
+# degenerate point mass that a continuous generator cannot reproduce (KS(dt) stuck ~0.54, see
+# docs/JOURNAL.md). We reconstruct plausible per-event timing by distributing the k events of a
+# snapshot uniformly across the gap [T, T_next) to the following snapshot. This is an explicit
+# ASSUMPTION (uniform intra-snapshot spacing) -- the true sub-timestamp order timing is not in
+# the L2 feed -- but it turns dt into a smooth positive distribution the model can learn.
+def _spread_snapshot_times(t: np.ndarray) -> np.ndarray:
+    t = t.astype(np.float64)
+    n = len(t)
+    out = t.copy()
+    distinct = np.unique(t)
+    med_gap = float(np.median(np.diff(distinct))) if len(distinct) > 1 else 1e-3
+    i = 0
+    while i < n:
+        j = i
+        while j < n and t[j] == t[i]:
+            j += 1
+        k = j - i
+        T = t[i]
+        T_next = t[j] if j < n else T + med_gap          # last run: fall back to median gap
+        out[i:j] = T + (np.arange(k) / k) * (T_next - T)  # k events uniformly in [T, T_next)
+        i = j
+    return out
+
+df = df.with_columns(pl.Series("time", _spread_snapshot_times(df["time"].to_numpy())))
+
 # Order-feature engineering: inter-arrival time, and depth = |price - mid| in ticks.
 df = df.with_columns(
     (pl.col("time").diff().fill_null(0.0)).alias("dt"),
