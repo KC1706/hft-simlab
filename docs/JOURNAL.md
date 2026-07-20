@@ -1674,3 +1674,17 @@ sizes as WorldAgent does.
 ---
 *(Next entry: P3.4 step 3 — resume-training the model for more epochs, then the autoregressive
 book-rolling coupling that turns spread/ret/imbalance into genuine KS tests.)*
+
+### Addendum (2026-07-20) — resume training + re-scored: the model has plateaued
+Added `--resume` to the driver (Lightning `ckpt_path`; EarlyStopping must be dropped on resume,
+else it evaluates `val_ema_loss` before the first validation logs it → RuntimeError). Continued
+epochs 5→19. `val_loss_simple` improved 0.371→**0.363** (epoch 6/7) then destabilised — spiked to
+0.49/0.53 at epochs 8–9 (constant 3e-4 LR too hot for late-stage), recovered, and oscillated
+~0.40 through epoch 19 without beating 0.363. Best kept:
+`output/val_ema=0.379_epoch=7_INTC_lr_0.0003_ep_20_...ckpt`. Re-ran first-pass generation with it:
+KS(size) 0.427→**0.426** (flat), KS(dt) 0.551→**0.522** (−5%), negative-size fraction 50.4%
+(unchanged). Conclusion: at ~10M params the order-flow marginals have plateaued and more epochs
+is not the lever — the ~50% negative-size fraction is a *representation* problem (size should be
+modelled on a positive support, e.g. log-size), and the trivially-matched book facts only become
+real tests under the autoregressive coupling. Those two — not longer training — are the next
+moves.
