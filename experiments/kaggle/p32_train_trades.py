@@ -201,9 +201,17 @@ def main():
             k["limit_val_batches"] = args.val_batches         # cap the expensive sampling val
             if args.limit_train_batches:
                 k["limit_train_batches"] = args.limit_train_batches
-            for cb in (k.get("callbacks") or []):             # relax EarlyStopping in place
-                if isinstance(cb, EarlyStopping):
-                    cb.patience = args.patience
+            if args.resume:
+                # On ckpt_path resume, Lightning evaluates the restored EarlyStopping callback
+                # before the first validation logs `val_ema_loss` -> RuntimeError. Drop it; the
+                # model saves its own best checkpoint via model_checkpointing, and a resume run
+                # has a fixed epoch budget anyway.
+                k["callbacks"] = [cb for cb in (k.get("callbacks") or [])
+                                  if not isinstance(cb, EarlyStopping)]
+            else:
+                for cb in (k.get("callbacks") or []):         # relax EarlyStopping in place
+                    if isinstance(cb, EarlyStopping):
+                        cb.patience = args.patience
             trainer = _OrigTrainer(*a, **k)
             if args.resume:                                   # inject ckpt_path into run()'s fit()
                 _orig_fit = trainer.fit
