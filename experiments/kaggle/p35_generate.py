@@ -81,6 +81,15 @@ def main():
             config.HYPER_PARAMETERS[p] = fixed[p.value]
     config.FILENAME_CKPT = "GEN"
 
+    # PyTorch >=2.6 defaults torch.load(weights_only=True), which cannot unpickle the custom
+    # `config` object Lightning stored in the checkpoint hparams. We trust our own checkpoint,
+    # so force full unpickling for every torch.load (incl. Lightning's internal call).
+    _orig_torch_load = torch.load
+    def _torch_load(*a, **k):
+        k["weights_only"] = False
+        return _orig_torch_load(*a, **k)
+    torch.load = _torch_load
+
     device = cst.DEVICE
     seq_size = config.HYPER_PARAMETERS[LHP.SEQ_SIZE]           # 256
     gen_seq_size = config.HYPER_PARAMETERS[LHP.MASKED_SEQ_SIZE]  # 1
