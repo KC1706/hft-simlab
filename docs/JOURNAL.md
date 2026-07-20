@@ -1594,3 +1594,83 @@ array, so it is ready for either path.
 *(Next entry: P3.4 step 2 — the GPU sampling wrapper around `DiffusionEngine.sample` with
 type de-embedding (after the Kaggle checkpoint exists), then the autoregressive book-rolling
 coupling into the Rust simulator.)*
+
+---
+
+## Entry 14 — P3.2 completed + P3.4 step 2: first-pass generation and its report card (2026-07-20)
+
+Two milestones in one session: the TRADES model finally **trained** (P3.2, which had been
+stuck), and the **generation → validation loop closed** (P3.4 step 2, first pass).
+
+### What was done — P3.2, the training that finally learned
+The 2026-07-19 full run had produced only an `epoch=0` checkpoint. Reading the Kaggle log
+showed it was **not** a crash: validation ran 100 diffusion-sampling batches (~35 min) *twice
+per epoch* while `EarlyStopping(patience=6)` gave up after ~3 epochs — and, decisively, the
+model was not learning at all (`val_loss_simple` pinned at 2.74). The cause was the **learning
+rate**: DeepMarket's base LR `0.001` is far too hot for our ~10M CDT. `experiments/kaggle/
+p32_train_trades.py` gained knobs to make validation cheap (`--val-batches`, `--val-every`,
+`--patience`, injected through the existing `L.Trainer` monkeypatch) and to retune the LR
+(`--lr` via the fixed-hparam dict; `--embed-lr` via a runtime patch of
+`configure_optimizers` — later found moot, the type embedder is frozen). A 3-point LR sweep
+(3e-4, 1e-4, 3e-5) all learned; **base LR 3e-4 won**. The full 5-epoch run drove
+`val_loss_simple` 0.421 → 0.371 (monotone, still descending) vs the broken 2.74 — a ~7×
+reduction. Checkpoint: `output/val_ema=0.389_epoch=4_INTC_lr_0.0003_ep_5_...ckpt`.
+
+### What was done — P3.4 step 2, the sampling wrapper
+`experiments/kaggle/p35_generate.py` (new). It loads the trained `DiffusionEngine`, slides real
+256-order windows through `val.npy`, and calls `model.sample(cond_orders, x=zeros, cond_lob)`
+once per window (`MASKED_SEQ_SIZE=1`, so one order per call). Each generated order is de-embedded
+— the categorical event type is recovered as the **nearest row (L1) of the frozen 3×3
+`type_embedder` matrix** to the embedded output, `direction = sign` — and the model's normalized
+numeric columns (`dt, size, price, depth`) are kept as-is. Every generated order is paired with
+its **real** book snapshot at the same timestamp, giving a 46-column array in p31's exact layout
+that `scripts/p34_denorm.py` inverts and `scripts/p33_validate.py` scores. 3,000 orders
+generated on Kaggle T4; the loop is copied with attribution from DeepMarket
+`ABIDES/agent/WorldAgent.py` (`_generate_order`, `_postprocess_generated_TRADES`).
+
+### Theory 14.1 — Why only two of the six KS numbers are real tests
+The report card: `size` KS=0.43, `dt` KS=0.55; `spread/ret/imbalance/kurtosis` all ≈0. The
+zeros are **not** skill — this is a *conditional* generation scored against a *real* book. Since
+we pair each generated order with the real LOB snapshot, every observable that is a deterministic
+function of the book (spread = ask−bid, mid-return, queue imbalance, return kurtosis) is
+identical between the real and generated CSVs by construction. Only the columns the model
+actually emits — inter-arrival `dt` and order `size` — test the generator. This is the
+microstructure point from Bouchaud *Trades, Quotes & Prices* (book chapters): the observables
+are read off the queue state; if you supply the real state, you are only testing the flow. Both
+flow marginals are currently far from real (KS≈0.4–0.55), consistent with a 5-epoch model whose
+loss was still dropping and that emits negative size ~50% of the time (kept, not resampled, for
+an honest first look — DeepMarket's WorldAgent rejects+regenerates these).
+
+### Theory 14.2 — Why the type de-embedding is a nearest-neighbour, not an argmax
+TRADES embeds the 3-class event type into a fixed 3-D vector *before* diffusion (a frozen
+`nn.Embedding(3,3)`), so the model denoises in the embedded space and its output for the type
+slot is a point in R³, not a class. The inverse is nearest-embedding: the class whose fixed
+embedding row is L1-closest to the generated vector. Using argmax over the raw slots (the
+commented-out alternative in WorldAgent) would be wrong because the slots are embedding
+coordinates, not class logits. This is the discrete-recovery subtlety flagged in Entry 13.
+
+### Paper used
+TRADES (arXiv 2502.07071) + the `refs/DeepMarket` reference: architecture, the frozen
+type-embedding trick, and the `sample()` conditioning interface all come from there; our wrapper
+reproduces its generation post-processing outside the ABIDES simulator so the same order stream
+scores through our p33/p34 tooling.
+
+### What still needs doing (so the next session knows where to start)
+(i) **Train longer** — 5 epochs was throughput-bound to ~2h; each epoch is only ~25 min, so
+10–20 more epochs are cheap and should pull `size`/`dt` KS down (needs `trainer.fit(ckpt_path=)`
+resume support in the driver). (ii) **Autoregressive book coupling** — feed each generated order
+into the book and condition the next window on the rolled-forward state; only then do
+spread/ret/imbalance become genuine tests. (iii) size-positivity: resample or constrain negative
+sizes as WorldAgent does.
+
+### Manual test for you (P3.4 step-2 gate — runs locally, no GPU)
+1. `ls -la experiments/data/p35/` → `generated.npy` and `real.npy`, both (3000, 46).
+2. `.venv/bin/python scripts/p34_denorm.py experiments/data/p35/generated.npy --out /tmp/g.csv`
+   and the same for `real.npy` → `/tmp/r.csv`.
+3. `.venv/bin/python scripts/p33_validate.py /tmp/r.csv /tmp/g.csv` → reproduce the KS table:
+   `size≈0.43`, `dt≈0.55`, and `spread/ret/imbalance≈0` (the by-construction ones). Confirm you
+   understand *why* the book-facts are 0 and only size/dt are real tests (Theory 14.1).
+
+---
+*(Next entry: P3.4 step 3 — resume-training the model for more epochs, then the autoregressive
+book-rolling coupling that turns spread/ret/imbalance into genuine KS tests.)*

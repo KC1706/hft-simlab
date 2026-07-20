@@ -259,6 +259,22 @@ PnL-prediction error attributable to each component. [Headline number goes here.
   > from the realism of the inter-arrival clock (itself scored as the dt distance). A model is
   > deemed to reproduce a stylized fact when its KS is near that floor; the per-fact table is
   > the generative model's realism scorecard.
+  >
+  > **Addendum (v1, 2026-07-20 — first-pass conditional scoring):** We first evaluate the model
+  > in a *conditional* mode that isolates the generated order flow from the generated book: each
+  > sampled event is produced from a real 256-event context and paired with the real
+  > contemporaneous book snapshot. This design has a deliberate consequence — every stylized
+  > fact that is a deterministic function of the book (spread, mid-return and its kurtosis,
+  > volume imbalance) is matched *by construction*, so its KS is trivially zero and reports
+  > nothing about the model. The informative tests in this mode are exactly the two quantities
+  > the model emits, order size and inter-arrival time. On a 3,000-event held-out sample from a
+  > model trained for five epochs (validation simple-loss 0.42→0.37, still descending), these
+  > stand at KS(size)=0.43 and KS(dt)=0.55 — far from the real-vs-real floor — with roughly half
+  > of generated sizes falling negative before post-hoc rejection. We report this as an explicit
+  > lower-bound checkpoint rather than a headline: it validates the full generate→de-normalize→
+  > score pipeline while showing that flow realism requires substantially more training, and it
+  > motivates the *unconditional* evaluation (§3.8, forthcoming), where the model rolls its own
+  > book forward autoregressively and the book-derived facts finally become genuine tests.
 
 *All figure content, axes, captions, and the raw data each phase must log are fully specified
 in `paper/FIGURES.md` — figures are designed before the data exists.*
