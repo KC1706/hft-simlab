@@ -48,6 +48,12 @@ def denormalize(X, stats):
     out = X.astype(np.float64).copy()
     for c in stats["z_scored_cols"]:
         out[:, c] = out[:, c] * std[c] + mean[c]
+    # Invert the log-transform p31 applied to strictly-positive features (size, dt): exp() is
+    # always positive, so the reconstructed values can never be negative. Older stats.json
+    # without "log_cols" (linear packing) simply skip this and behave as before.
+    order_feats = stats["order_features"]
+    for name in stats.get("log_cols", []):
+        out[:, order_feats.index(name)] = np.exp(out[:, order_feats.index(name)])
     return out
 
 
@@ -109,8 +115,13 @@ def self_test(stats_path):
     X = np.load(P31 / "val.npy").astype(np.float64)
     Xd = denormalize(X, stats)
 
-    # 1) invertibility: re-apply p31's z-score and compare to the stored normalized array.
+    # 1) invertibility: re-apply p31's forward transform (log then z-score) and compare to the
+    #    stored normalized array. Order mirrors p31: log-transform first, then z-score.
     Xr = Xd.copy()
+    log_floor = stats.get("log_floor", 1e-9)
+    for name in stats.get("log_cols", []):
+        c = stats["order_features"].index(name)
+        Xr[:, c] = np.log(np.maximum(Xr[:, c], log_floor))
     for c in stats["z_scored_cols"]:
         Xr[:, c] = (Xr[:, c] - mean[c]) / std[c]
     max_err = float(np.abs(Xr - X).max())

@@ -60,6 +60,18 @@ lob_cols = [c for c in df.columns if c.startswith(("ask_p", "ask_s", "bid_p", "b
 X = df.select(order_feats + lob_cols).to_numpy().astype(np.float64)
 n, d = X.shape
 
+# Log-transform strictly-positive, heavy-tailed order features (size, dt) BEFORE z-scoring.
+# Reason: the model generates on an unbounded support, so a plain z-scored `size` de-normalizes
+# to negatives ~50% of the time (impossible orders — see docs/JOURNAL.md Entry 14). Training on
+# log(size) means the generation inverse is exp(), which is ALWAYS positive: negative sizes
+# become mathematically impossible. Same argument for inter-arrival dt (>= 0). A tiny floor
+# guards log(0) (simultaneous events give dt=0). p34_denorm.py inverts with exp() on these cols.
+LOG_FEATS = ["dt", "size"]
+LOG_FLOOR = 1e-9
+log_idx = [order_feats.index(c) for c in LOG_FEATS]
+for c in log_idx:
+    X[:, c] = np.log(np.maximum(X[:, c], LOG_FLOOR))
+
 # z-score the continuous columns; leave event_type/direction (categorical) untouched.
 z_cols = [order_feats.index(c) for c in ("dt", "size", "price", "depth")]
 z_cols += list(range(len(order_feats), d))  # all LOB columns
@@ -79,6 +91,8 @@ stats = {
     "order_features": order_feats,
     "lob_columns": lob_cols,
     "z_scored_cols": z_cols,
+    "log_cols": LOG_FEATS,      # inverted with exp() in p34 (guarantees positive size/dt)
+    "log_floor": LOG_FLOOR,
     "mean": mean.tolist(),
     "std": std.tolist(),
     "levels": LEVELS,
