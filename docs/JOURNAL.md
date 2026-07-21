@@ -1720,3 +1720,60 @@ via two diagnosed representation fixes, not more epochs. Remaining: dt at 0.15 c
 with more training or a better dt tail model; the book facts (spread/ret/imbalance) stay trivially
 0 until the autoregressive coupling — now the clear next step, since both marginals are handled.
 Ckpt: output/spread_val_ema=0.63_epoch=4_...; data assumption documented for reviewers.
+
+## Entry 15 — P3.4 step 3: the autoregressive book coupling + first genuine book-geometry scorecard (2026-07-21)
+
+Built the autoregressive coupling (design in docs/P34_AUTOREGRESSIVE_DESIGN.md): the model rolls
+its OWN book forward, so spread/ret/imbalance stop being trivially 0 and become real tests.
+
+### What was done
+- `experiments/kaggle/autoreg_book.py` — a top-10 Python `L2Book` mirroring `core/book.rs`, with
+  `APPLY` implementing lob_export.rs's L2 event semantics (submission +size, cancel/delete -size,
+  execution = book no-op) and depth-based price reconstruction. **Validated on 100k real
+  order->book transitions: 98.1% exact full-top10, 100% top-of-book** (the 1.9% misses are
+  hidden-level promotions beyond the 10-level horizon — a real limitation, not a bug).
+- `experiments/kaggle/p36_autoregressive.py` — the rollout loop (seed real window -> sample ->
+  de-embed -> denorm -> APPLY -> re-normalize snapshot -> slide window), with rejection sampling on
+  invalid books. `model.sample` is pluggable, so the mechanics were smoke-tested locally with NO
+  GPU: a mock replaying real orders makes the autoreg book track the real book 100% at top-of-book
+  over 300 steps, 0 crossed/empty, exact (1e-13) norm round-trip.
+- First GPU run (kernel hft-p36-autoreg): 20 rollouts x 150 steps = 3000 self-generated orders,
+  **0 rejects, 0 crossed, 0 empty across all rollouts** — the book stayed valid, compounding drift
+  did not collapse it.
+
+### The first genuine scorecard (autoregressive book vs representative real)
+KS(size)=0.12, KS(dt)=0.19 (both HELD from the first-pass — autoregression didn't break the
+marginals); **KS(spread)=0.59, KS(imbalance)=0.35 — now REAL tests, and they FAIL.** ret≈0 is a
+weak signal (real per-event returns are ~0). Diagnosis: real BTCUSDT spread is ~always 1 tick;
+the generated book's spread blows out to tens of ticks because the model does not reproduce the
+instant top-level *refilling* that keeps real spreads tight — so the book gradually loosens under
+autoregression. GOTCHA (caught during eval): the first real reference was a degenerate static
+window (mid constant, spread==1 for 3000 events) giving spurious KS(spread)=1.0 / kurtosis=-3;
+fixed by sampling 20 representative real 150-windows mirroring the rollout structure.
+
+### Theory 15.1 — Why the marginals pass but the geometry fails
+size/dt are *marginal* distributions the model emits directly; the book facts are *emergent* from
+the joint dynamics of where orders land and how the queue refills (Bouchaud, *Trades, Quotes &
+Prices*, on the order book and the empirical tightness of large-cap spreads). A model can match
+each order's marginal size/timing yet still assemble a book whose geometry (spread, imbalance) is
+wrong, because geometry depends on the *interaction* of submissions/cancels at the touch. This is
+the value of the autoregressive test: it exposes joint-dynamics errors that per-event marginal
+scores (the first-pass) cannot see. The next lever is not training length or a marginal transform
+but the touch dynamics — e.g. conditioning/penalizing on spread, or a refill-aware event model.
+
+### Paper
+Draft paper §3.8 (unconditional/autoregressive evaluation) with this scorecard as [FIG-7]: the
+generator reproduces order-flow marginals (size/dt KS ~0.1-0.2) but not yet book geometry
+(spread/imbalance), with a valid, non-collapsing book over 150-step rollouts.
+
+### Manual test for you (runs locally, no GPU)
+1. `.venv/bin/python experiments/kaggle/autoreg_book.py --validate /tmp/rows_log.csv` → 98% exact
+   / 100% top-of-book on real transitions.
+2. `.venv/bin/python experiments/kaggle/p36_autoregressive.py --smoke` → PASS (100% real-book
+   tracking, 0 crossed/empty).
+3. Understand why spread/imbalance (0.59/0.35) are *now* meaningful but were 0 in the first pass
+   (Theory 15.1): the book is the model's own, not real.
+
+---
+*(Next entry: touch/refill dynamics to tighten the generated spread — condition or penalize on
+spread, or a refill-aware event model — then re-score the autoregressive book geometry.)*
