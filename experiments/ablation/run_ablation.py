@@ -25,6 +25,22 @@ BIN = Path("core/target/release/backtest")
 CONFIG_ORDER = ["naive", "+fill", "+fill+latency", "+fill+latency+impact"]
 
 
+def bootstrap_ci(diffs, B=10000, level=95, seed=0):
+    """Mean of paired per-seed ΔPnL with a percentile bootstrap CI. Deterministic diffs (the
+    OFI taker: all seeds identical) collapse to a point, which is the honest answer there."""
+    d = np.asarray(diffs, dtype=float)
+    d = d[np.isfinite(d)]
+    if len(d) == 0:
+        return np.nan, np.nan, np.nan
+    if d.std() == 0.0:  # deterministic component effect — no seed noise to bootstrap
+        return d.mean(), d.mean(), d.mean()
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, len(d), size=(B, len(d)))
+    means = d[idx].mean(axis=1)
+    lo, hi = (100 - level) / 2, 100 - (100 - level) / 2
+    return d.mean(), float(np.percentile(means, lo)), float(np.percentile(means, hi))
+
+
 def one_run(npz, strategy, half_spread, seed):
     out = subprocess.run(
         [str(BIN), npz, "--csv", "--strategy", strategy,
@@ -38,7 +54,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--npz", required=True, help="the day to backtest")
     ap.add_argument("--half-spreads", default="20,40,60,80", help="MM strategy variants (ticks)")
-    ap.add_argument("--seeds", type=int, default=8, help="seeds per cell (PnL dispersion)")
+    ap.add_argument("--seeds", type=int, default=16, help="seeds per cell (PnL dispersion)")
     ap.add_argument("--out", default="experiments/ablation/results.parquet")
     args = ap.parse_args()
 
@@ -79,16 +95,28 @@ def main():
             prev = m
         print()
 
-    # --- the cross-strategy story: marginal effect of each component, PER strategy type ---
-    print("marginal realism effect (mean ΔPnL when each component switches on), by strategy type:")
-    for strat in ("mm", "ofi"):
-        sub = df.filter(pl.col("strategy") == strat)
-        means = {cfg: sub.filter(pl.col("config") == cfg)["pnl"].mean() for cfg in CONFIG_ORDER}
-        parts = [f"{b.split('+')[-1]}: {means[b] - means[a]:+.3f}"
-                 for a, b in zip(CONFIG_ORDER, CONFIG_ORDER[1:])]
-        print(f"  {strat:>4}:  " + "   ".join(parts) + "  USDT")
-    print("  -> the fill/queue model matters for the MM but is ~0 for the taker (takers always fill);")
-    print("     impact affects both. WHICH realism component matters depends on the strategy.")
+    # --- marginal effect of each component with a PAIRED bootstrap CI (per subject) ---
+    # Pairing is per (subject, seed): Δ = PnL(cfg_b, seed) − PnL(cfg_a, seed), removing the shared
+    # per-seed randomness so the CI isolates the component's effect. "sig" = 95% CI excludes 0.
+    print("marginal realism effect — mean ΔPnL [95% bootstrap CI], sig = CI excludes 0:")
+    print(f"{'subject':>13} | {'component':>8} | {'ΔPnL':>8} | {'95% CI':>20} | sig")
+    print("-" * 66)
+    transitions = [(a, b, b.split("+")[-1]) for a, b in zip(CONFIG_ORDER, CONFIG_ORDER[1:])]
+    for strat, hs in subjects:
+        label = "ofi-taker" if strat == "ofi" else f"mm(½={hs:.0f})"
+        sel = (pl.col("strategy") == strat) & (pl.col("half_spread") == hs)
+        for a, b, comp in transitions:
+            pa = df.filter(sel & (pl.col("config") == a)).sort("seed")["pnl"].to_numpy()
+            pb = df.filter(sel & (pl.col("config") == b)).sort("seed")["pnl"].to_numpy()
+            m, lo, hi = bootstrap_ci(pb - pa)
+            sig = "yes" if (lo > 0 and hi > 0) or (lo < 0 and hi < 0) else " no"
+            ci = "(deterministic)" if lo == hi else f"[{lo:+.3f}, {hi:+.3f}]"
+            print(f"{label:>13} | {comp:>8} | {m:>+8.3f} | {ci:>20} | {sig}")
+        print()
+
+    print("  -> MM: fill/queue model is a significant, non-zero effect; OFI taker: fill & latency are")
+    print("     EXACTLY 0 (deterministic — takers always fill), only impact bites. Which realism")
+    print("     component matters, and whether it is statistically real, depends on the strategy.")
     print("\n(NOTE: in-sample only. The true sim-to-real GAP needs a held-out 2nd day — see the design doc.)")
 
 
