@@ -1802,3 +1802,60 @@ volume ratio), and levels are already full. Honest options for imbalance: bigger
 to the Phase-4 PnL test. NOTE: the `depth` column itself is still garbage (denorms negative, same
 flaw size had) — worth a log-transform for cleanliness/level-price realism, but it is not the
 imbalance lever.
+
+## Entry 16 — P4 step 1: the sim-to-real ablation harness + the cross-strategy finding (2026-07-21)
+
+Built the Phase-4 harness (the headline contribution's machinery) and its first result. Design in
+docs/PHASE4_ABLATION_DESIGN.md.
+
+### What was done
+- `core/src/bin/backtest.rs` gained `--csv` (machine output), `--half-spread` (a strategy knob →
+  the MM is a parametric ablation subject), and `--strategy mm|ofi`. Added an **OFI-momentum taker**:
+  on each decision grid it crosses the spread toward the top-5 book imbalance when |imb−0.5|>0.15.
+  A taker fills immediately at the touch (crossing the spread is its cost) and pays a 4bps taker
+  fee; under +impact its fill price is shifted by the accumulated propagator so it pays for the
+  price it has moved.
+- `experiments/ablation/run_ablation.py` sweeps {MM at 4 half-spreads} + {OFI taker} × 8 seeds × 4
+  realism configs → tidy `results.parquet` + the realism WATERFALL and the per-strategy marginal
+  effect. `make ablation` reproduces it (root Makefile).
+- `scripts/record_market.sh` launches the self-recording collector (refs/hftbacktest/collector,
+  built) to accumulate day 2+ from live Binance/Bybit websockets — the data the out-of-sample gap
+  needs. (Can't run inside the Claude sandbox: it allowlists a few domains and blocks all exchanges.)
+
+### The finding (in-sample, 1 day, 160 backtests)
+Marginal ΔPnL when each realism component switches on:
+- **MM:**  fill −1.81,  latency +0.92,  impact −1.72 USDT (all with seed dispersion).
+- **OFI taker:**  fill **+0.00**, latency **+0.00**, impact −3.80 USDT (std 0 throughout).
+The taker's fill/latency effects are EXACTLY zero because a taker always fills at the touch — the
+calibrated queue fill-model (and the latency race, which only gates resting-order fills) simply do
+not apply to it. Impact affects both, and MORE for the aggressive taker (8021 fills). So **which
+realism component matters is strategy-dependent** — the central argument for a multi-strategy
+ablation, shown numerically.
+
+### Theory 16.1 — Why the fill model is a no-op for takers
+Phase 2's calibrated fill model (Entry 6, arXiv 2403.02572) answers "given my resting order at queue
+position q, what is P(fill within τ)?" — a *maker's* question. A market order has no queue position;
+it consumes liquidity at the touch and fills with probability 1 (modulo depth). So the realism
+component that dominates the maker's backtest error (queue/fill) is irrelevant to the taker, whose
+error is dominated by *impact* and slippage (Bouchaud, *Trades, Quotes & Prices*, on the cost of
+crossing the spread and market impact). Measuring per-strategy is therefore not a nicety — a
+single-strategy ablation would generalize a strategy-specific conclusion.
+
+### Gating prerequisite (honest)
+Only 1 day (`btcusdt_20260501`) exists; the true OUT-OF-SAMPLE sim-to-real gap needs ≥2 (calibrate
+on A, test held-out B). Until day 2 is recorded (collector, running on the user's machine) or
+downloaded (Tardis free-of-month), the harness is in-sample only — it validates the machinery and
+the per-strategy realism effects, not the headline number.
+
+### Manual test for you
+`make ablation` → reproduces the waterfall; spot-check that the ofi-taker row shows PnL std=0 and
+identical PnL across naive/+fill/+latency (fill-model no-op) but a shift at +impact.
+
+### Next
+The `+generative` config (5th cell) needs a converter (autoreg.npy → the npz Event stream, format
+known) AND a full-day-scale continuous rollout (millions of events; the current 3000-event market
+is too short/discontinuous) — a scale gate, flagged not faked. Then: day 2 → the real held-out gap.
+
+---
+*(Next entry: acquire day 2 (collector/Tardis) for the out-of-sample sim-to-real gap, or the
++generative converter + a scaled continuous rollout.)*
