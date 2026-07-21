@@ -1777,3 +1777,28 @@ generator reproduces order-flow marginals (size/dt KS ~0.1-0.2) but not yet book
 ---
 *(Next entry: touch/refill dynamics to tighten the generated spread — condition or penalize on
 spread, or a refill-aware event model — then re-score the autoregressive book geometry.)*
+
+### Entry 15 — CORRECTION (2026-07-21): spread was a metric artifact; imbalance is the real gap
+Follow-up diagnosis overturned Entry 15's "spread/imbalance both fail". Two measurement bugs
+inflated the spread KS: (1) a degenerate real reference (a static val slice, mid constant / spread
+==1 for 3000 events) gave KS(spread)=1.0; fixed with a representative reference (20 random
+150-windows). (2) Even then, spread read 0.60 — a pure FLOAT artifact: spread is discrete (integer
+ticks) but the z-score denorm round-trip leaves real spreads at 1.0 +/- 1e-5 while the generated
+book's spread is exactly 1.0, so ks_2samp flagged the sub-tick noise. Rounding spread to ticks in
+p33_validate.py (commit) gives **KS(spread)=0.00**. And the spread TRAJECTORY within rollouts
+confirms it: 6.0 -> 1.0 ticks by step ~30 and flat thereafter. So the autoregressive book maintains
+the correct 1-tick spread — the "touch/refill" concern was unfounded; APPLY's marketable-price clip
+keeps the touch tight.
+
+**Corrected autoregressive scorecard:** KS(spread)=0.00, KS(size)=0.12, KS(dt)=0.19, ret~0 — all
+good; **KS(imbalance)=0.35 is the ONE genuine remaining gap.** Diagnosed it is NOT a depth/level
+problem (both books populate 10/10 levels) nor direction (51/49 vs real 54/46) — it is a
+volume-BALANCE bias: the generated book runs bid-heavy (imbalance median ~0.57-0.63) while real is
+ask-heavy (~0.36). That is a subtle emergent joint-dynamics difference (relative bid/ask size &
+cancel/submit intensity), not a cheap representation fix. Deliberately did NOT launch a speculative
+log-depth retrain: diagnosis shows depth (which sets level PRICES) does not drive imbalance (a
+volume ratio), and levels are already full. Honest options for imbalance: bigger model / more data
+(joint dynamics need capacity), a side-aware size head, or accept it as the current limit and move
+to the Phase-4 PnL test. NOTE: the `depth` column itself is still garbage (denorms negative, same
+flaw size had) — worth a log-transform for cleanliness/level-price realism, but it is not the
+imbalance lever.
