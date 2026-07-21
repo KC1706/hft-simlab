@@ -182,9 +182,59 @@ def main():
         smoke_test(args.steps)
         return
 
-    # --- Kaggle path: wrap the real model as sample_fn (built in piece 3b / next step) ---
-    raise SystemExit("GPU rollout wiring (real DiffusionEngine sample_fn) lands in the next step; "
-                     "run --smoke to validate the loop mechanics first.")
+    # --- Kaggle path: wrap the trained DiffusionEngine as sample_fn and roll forward ---
+    os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+    dm = Path(args.deepmarket).resolve()
+    sys.path.insert(0, str(dm)); os.chdir(dm)
+    import torch
+    import constants as cst
+    import configuration
+    from run import HP_DICT_MODEL
+    from models.diffusers.diffusion_engine import DiffusionEngine
+
+    LHP = cst.LearningHyperParameter
+    fixed = HP_DICT_MODEL[cst.Models.TRADES].fixed
+    fixed[LHP.AUGMENT_DIM.value] = args.augment_dim
+    fixed[LHP.CDT_DEPTH.value] = args.depth
+    config = configuration.Configuration()
+    config.CHOSEN_MODEL = cst.Models.TRADES
+    config.CHOSEN_STOCK = [cst.Stocks["INTC"]]
+    config.IS_DATA_PREPROCESSED = True
+    config.IS_WANDB = config.IS_SWEEP = config.IS_TRAINING = config.IS_DEBUG = False
+    for p in cst.LearningHyperParameter:
+        if p.value in fixed:
+            config.HYPER_PARAMETERS[p] = fixed[p.value]
+    config.FILENAME_CKPT = "AUTOREG"
+
+    _ol = torch.load                                    # PyTorch>=2.6 weights_only fix (see p35)
+    torch.load = lambda *a, **k: _ol(*a, **{**k, "weights_only": False})
+    device = cst.DEVICE
+    model = DiffusionEngine.load_from_checkpoint(args.ckpt, config=config, map_location=device)
+    model.eval().to(device)
+    model.training = False
+
+    def sample_fn(cond_orders, cond_lob, step):
+        co = torch.tensor(cond_orders, dtype=torch.float32, device=device).unsqueeze(0)
+        cl = torch.tensor(cond_lob, dtype=torch.float32, device=device).unsqueeze(0)
+        x = torch.zeros(1, config.HYPER_PARAMETERS[LHP.MASKED_SEQ_SIZE], cst.LEN_ORDER, device=device)
+        with torch.no_grad():
+            return model.sample(cond_orders=co, x=x, cond_lob=cl)[0, 0].detach().cpu().numpy()
+
+    stats = json.loads((Path(args.data) / "stats.json").read_text())
+    val = np.load(Path(args.data) / "val.npy").astype(np.float64)
+    rng = np.random.default_rng(0)
+    hi = len(val) - 256 - args.rollout_len
+    all_rows, healths = [], []
+    for r in range(args.n_rollouts):
+        seed = int(rng.integers(0, hi))
+        out, health = run_rollout(sample_fn, val, stats, K=args.rollout_len,
+                                  seed_index=seed, reject=True, log_every=50)
+        all_rows.append(out); healths.append(health)
+        print(f"[rollout {r+1}/{args.n_rollouts}] seed={seed} health={health}", flush=True)
+    arr = np.concatenate(all_rows, 0)
+    np.save(args.out, arr)
+    tot_cross = sum(h["crossed"] for h in healths); tot_empty = sum(h["empty_side"] for h in healths)
+    print(f"[done] wrote {args.out} {arr.shape}; total crossed={tot_cross} empty={tot_empty}", flush=True)
 
 
 if __name__ == "__main__":
