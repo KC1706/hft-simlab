@@ -1705,3 +1705,18 @@ handle the dt=0 mass explicitly, or a hurdle/mixture), and the autoregressive co
 book facts. NOTE: p35_generate's internal `neg_size` counter now reports pre-exp normalized-space
 negatives (~50%) and is misleading for log data; the true post-exp negative fraction is 0%
 (verified on the denormalized CSV).
+
+### Addendum 3 (2026-07-21) — event-time spreading: dt KS 0.54 → 0.15
+Diagnosis (Addendum 2 follow-up): dt's KS was dominated by a data artifact — L2 snapshots unpack
+~21 events (max 1266) onto one timestamp, so 95.3% of raw dt are exact zeros (a degenerate point
+mass a continuous generator cannot reproduce). Fix in p31_pack_trades.py: distribute each
+snapshot's k events uniformly across the gap [T, T_next) before computing dt — an explicit
+uniform-intra-snapshot-spacing assumption (true sub-timestamp timing is absent from the L2 feed).
+Re-packed (dt<1e-6: 95.7%→1.3%), re-uploaded hft-p31log, retrained config A 5ep, regenerated,
+scored. **Full progression — KS(dt): 0.551 (linear) → 0.539 (log) → 0.150 (log+spread); KS(size):
+0.427 → 0.089 → 0.106; negatives 50.4% → 0% → 0%.** Both order-flow marginals now sit at
+0.10–0.15 (real-vs-real floor ~0.03–0.04) — from "badly failing" to "captures the shape well"
+via two diagnosed representation fixes, not more epochs. Remaining: dt at 0.15 could reach <0.1
+with more training or a better dt tail model; the book facts (spread/ret/imbalance) stay trivially
+0 until the autoregressive coupling — now the clear next step, since both marginals are handled.
+Ckpt: output/spread_val_ema=0.63_epoch=4_...; data assumption documented for reviewers.
