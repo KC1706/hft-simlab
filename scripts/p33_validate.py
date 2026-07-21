@@ -32,7 +32,12 @@ def load(path):
     df = pl.read_csv(path, infer_schema_length=None)
     bid1, ask1 = df["bid_p1"].to_numpy().astype(float), df["ask_p1"].to_numpy().astype(float)
     mid = (bid1 + ask1) / 2.0
+    # Spread is inherently DISCRETE (integer ticks). Round before comparing: the z-score denorm
+    # round-trip leaves real spreads at 1.0 +/- 1e-5, and KS against an exactly-1.0 generated
+    # spread would report a spurious ~0.6 from that sub-tick float noise. Round -> compare at the
+    # only resolution that means anything.
     spread = (df["spread"].to_numpy().astype(float) if "spread" in df.columns else ask1 - bid1)
+    spread = np.round(spread)
     size = df["size"].to_numpy().astype(float)
     imb = (df["imbalance"].to_numpy().astype(float) if "imbalance" in df.columns
            else np.full(len(mid), np.nan))
