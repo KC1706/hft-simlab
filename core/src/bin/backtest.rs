@@ -48,7 +48,21 @@ const SKEW_TICKS: f64 = 10.0;
 const ORDER_QTY: f64 = 0.001; // BTC
 const MAX_POSITION: f64 = 0.005; // BTC
 const MAKER_FEE: f64 = 0.0002; // 2 bps, post-only (GTX)
+const TAKER_FEE: f64 = 0.0004; // 4 bps, aggressive (OFI taker)
 const NAIVE_LATENCY_NS: i64 = 10_000_000; // 10 ms constant baseline
+
+// OFI-momentum taker (P4, a second ablation subject): cross the spread in the direction of the
+// top-of-book volume imbalance when it exceeds a threshold. A TAKER always fills at the touch, so
+// the calibrated queue fill-model is irrelevant to it (a deliberate contrast with the MM) — while
+// market impact still applies. Latency-slippage is a v1 simplification: fills at decision-time touch.
+const OFI_LEVELS: usize = 5;
+const OFI_THRESHOLD: f64 = 0.15; // take when |imbalance − 0.5| exceeds this
+
+#[derive(Clone, Copy, PartialEq)]
+enum Strategy {
+    Mm,       // fixed-offset skewed market maker (the P0/P2 subject)
+    OfiTaker, // order-flow-imbalance momentum taker
+}
 
 /// One resting virtual order. `fill_time` is the scheduled calibrated fill instant
 /// (`i64::MAX` = never / naive path); `active_ts` is when it becomes fillable.
@@ -109,6 +123,7 @@ fn schedule_fill_time(active_ts: i64, p_1s: f64, rng: &mut Xor64) -> i64 {
 
 struct Sim {
     cfg: Config,
+    strategy: Strategy,
     half_spread: f64, // strategy knob (ticks): the MM's quoted half-spread (P4 ablation subject)
     book: L2Book,
     fill_model: CalibratedFillModel,
@@ -149,6 +164,55 @@ impl Sim {
             self.kernel.push(at, -1.0, ORDER_QTY);
         }
         self.ask = None;
+    }
+
+    /// OFI-momentum taker decision at grid time `now`: cross the spread toward the imbalance.
+    fn ofi_decide(&mut self, now: i64) {
+        let bids = self.book.top_n(Side::Bid, OFI_LEVELS);
+        let asks = self.book.top_n(Side::Ask, OFI_LEVELS);
+        let bid_vol: f64 = bids.iter().map(|l| l.qty).sum();
+        let ask_vol: f64 = asks.iter().map(|l| l.qty).sum();
+        let tot = bid_vol + ask_vol;
+        if tot <= 0.0 {
+            return;
+        }
+        let imb = bid_vol / tot; // > 0.5 = bid-heavy → momentum up → buy
+        if imb > 0.5 + OFI_THRESHOLD && self.position < MAX_POSITION {
+            if let Some(a) = self.book.best_ask() {
+                self.market_take(Side::Bid, a.px, now); // buy, lifting the ask
+            }
+        } else if imb < 0.5 - OFI_THRESHOLD && self.position > -MAX_POSITION {
+            if let Some(b) = self.book.best_bid() {
+                self.market_take(Side::Ask, b.px, now); // sell, hitting the bid
+            }
+        }
+    }
+
+    /// A market order: fills immediately at the touch `px` (crossing the spread is the taker cost),
+    /// pays the taker fee, and — like our maker fills — pushes a market-impact impulse. Under the
+    /// impact config the fill price is shifted by the accumulated propagator so an aggressive taker
+    /// pays for the price it has already moved (impact feeds back into its own fills).
+    fn market_take(&mut self, take_side: Side, px: f64, now: i64) {
+        let (qty_sign, dir) = if take_side == Side::Bid { (1.0, 1.0) } else { (-1.0, -1.0) };
+        let px = if self.cfg.impact {
+            px + self.kernel.impact(now) * TICK_SIZE
+        } else {
+            px
+        };
+        self.position += qty_sign * ORDER_QTY;
+        self.cash -= qty_sign * px * ORDER_QTY;
+        let fee = TAKER_FEE * px * ORDER_QTY;
+        self.cash -= fee;
+        self.stats.fees += fee;
+        self.stats.fills += 1;
+        if take_side == Side::Bid {
+            self.stats.buy_fills += 1;
+        } else {
+            self.stats.sell_fills += 1;
+        }
+        if self.cfg.impact {
+            self.kernel.push(now, dir, ORDER_QTY);
+        }
     }
 
     /// Execute any calibrated fills whose scheduled instant has arrived by `now`.
@@ -227,7 +291,7 @@ impl Sim {
     }
 }
 
-fn run(path: &str, cfg: Config, seed: u64, grid_ns: i64, half_spread: f64) -> Stats {
+fn run(path: &str, cfg: Config, seed: u64, grid_ns: i64, half_spread: f64, strategy: Strategy) -> Stats {
     let reader = NpzEventReader::open(path).expect("open npz");
     let latency: Box<dyn LatencyModel> = if cfg.calibrated_latency {
         Box::new(calibrated_race_latency(seed))
@@ -236,6 +300,7 @@ fn run(path: &str, cfg: Config, seed: u64, grid_ns: i64, half_spread: f64) -> St
     };
     let mut sim = Sim {
         cfg,
+        strategy,
         half_spread,
         book: L2Book::new(TICK_SIZE, LOT_SIZE),
         fill_model: CalibratedFillModel::new(),
@@ -270,7 +335,10 @@ fn run(path: &str, cfg: Config, seed: u64, grid_ns: i64, half_spread: f64) -> St
             next_grid = now.div_euclid(grid_ns) * grid_ns + grid_ns;
         }
         while now > next_grid {
-            sim.requote(next_grid);
+            match sim.strategy {
+                Strategy::Mm => sim.requote(next_grid),
+                Strategy::OfiTaker => sim.ofi_decide(next_grid),
+            }
             next_grid += grid_ns;
         }
 
@@ -320,12 +388,23 @@ fn main() {
     let mut grid_ms = 1000i64;
     let mut half_spread = HALF_SPREAD_TICKS; // strategy knob (P4)
     let mut csv = false; // machine-readable output for the ablation harness
+    let mut strategy = Strategy::Mm;
+    let mut strat_name = "mm";
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
             "--seed" => { seed = args[i + 1].parse().expect("bad seed"); i += 2; }
             "--grid-ms" => { grid_ms = args[i + 1].parse().expect("bad grid-ms"); i += 2; }
             "--half-spread" => { half_spread = args[i + 1].parse().expect("bad half-spread"); i += 2; }
+            "--strategy" => {
+                strat_name = match args[i + 1].as_str() {
+                    "mm" => "mm",
+                    "ofi" => "ofi",
+                    s => { eprintln!("unknown strategy: {s} (use mm|ofi)"); std::process::exit(2); }
+                };
+                strategy = if strat_name == "ofi" { Strategy::OfiTaker } else { Strategy::Mm };
+                i += 2;
+            }
             "--csv" => { csv = true; i += 1; }
             a => { eprintln!("unknown arg: {a}"); std::process::exit(2); }
         }
@@ -341,19 +420,19 @@ fn main() {
 
     if csv {
         // one row per config; header lets the P4 harness (experiments/ablation) parse it directly.
-        println!("config,half_spread,seed,fills,buys,sells,pnl,fees,end_pos,cancel");
+        println!("strategy,config,half_spread,seed,fills,buys,sells,pnl,fees,end_pos,cancel");
         for cfg in configs {
-            let s = run(path, cfg, seed, grid_ns, half_spread);
+            let s = run(path, cfg, seed, grid_ns, half_spread, strategy);
             println!(
-                "{},{},{},{},{},{},{:.6},{:.6},{:.6},{}",
-                cfg.name, half_spread, seed, s.fills, s.buy_fills, s.sell_fills,
+                "{},{},{},{},{},{},{},{:.6},{:.6},{:.6},{}",
+                strat_name, cfg.name, half_spread, seed, s.fills, s.buy_fills, s.sell_fills,
                 s.final_equity, s.fees, s.final_position, s.cancelled_unfilled
             );
         }
         return;
     }
 
-    println!("HFT-SimLab P2.5/P2.6 ablation backtest — {path}  (grid={grid_ms}ms, seed={seed}, half_spread={half_spread})");
+    println!("HFT-SimLab P2.5/P2.6 ablation backtest — {path}  (grid={grid_ms}ms, seed={seed}, strategy={strat_name}, half_spread={half_spread})");
     println!("PnL is quote-currency (USDT) mark-to-market: cash + position * last_mid.");
     println!(
         "{:>22} | {:>7} | {:>7} | {:>7} | {:>12} | {:>8} | {:>8} | {:>9}",
@@ -361,7 +440,7 @@ fn main() {
     );
     println!("{}", "-".repeat(96));
     for cfg in configs {
-        let s = run(path, cfg, seed, grid_ns, half_spread);
+        let s = run(path, cfg, seed, grid_ns, half_spread, strategy);
         println!(
             "{:>22} | {:>7} | {:>7} | {:>7} | {:>12.4} | {:>8.4} | {:>8.4} | {:>9}",
             cfg.name, s.fills, s.buy_fills, s.sell_fills, s.final_equity, s.fees, s.final_position,
