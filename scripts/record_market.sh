@@ -5,10 +5,16 @@
 # (docs/PHASE4_ABLATION_DESIGN.md). Leave it running; each full UTC day yields one recording.
 #
 # The binary is built from refs/hftbacktest/collector (read-only reference; we only RUN it).
-#   Usage:  scripts/record_market.sh [symbol ...]        # default: btcusdt
+#   Usage:  scripts/record_market.sh [symbol ...]                  # default: btcusdt, Binance USD-M
+#           EXCHANGE=bybit scripts/record_market.sh btcusdt        # if Binance is geo-blocked for you
 #   Stop:   Ctrl-C  (partial day is still a valid, if short, recording)
+#
+# NOTE: must run on YOUR machine, NOT the Claude sandbox (which allowlists only a few domains and
+# blocks all crypto exchanges). If Binance returns nothing, you are likely in a Binance-blocked
+# region (e.g. US) — set EXCHANGE=bybit or EXCHANGE=hyperliquid (both supported by the collector).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+EXCHANGE="${EXCHANGE:-binancefuturesum}"   # binancefuturesum | binancefutures | bybit | hyperliquid
 
 BIN="$ROOT/refs/hftbacktest/target/release/collector"
 [ -x "$BIN" ] || BIN="$ROOT/refs/hftbacktest/collector/target/release/collector"
@@ -20,8 +26,8 @@ fi
 OUT="$ROOT/data/raw/recorded"
 mkdir -p "$OUT"
 SYMBOLS="${*:-btcusdt}"
-PREFIX="$OUT/binancefuturesum"
+PREFIX="$OUT/$EXCHANGE"
 
-echo "recording [$SYMBOLS] from binancefuturesum -> ${PREFIX}_<UTCdate>.gz"
-echo "(streams: trade + bookTicker + depth@0ms; Ctrl-C to stop)"
-exec "$BIN" "$PREFIX" binancefuturesum $SYMBOLS
+echo "recording [$SYMBOLS] from $EXCHANGE -> ${PREFIX}_<UTCdate>.gz"
+echo "(streams: trade + bookTicker + depth; Ctrl-C to stop)"
+exec "$BIN" "$PREFIX" "$EXCHANGE" $SYMBOLS
