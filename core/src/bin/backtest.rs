@@ -109,6 +109,7 @@ fn schedule_fill_time(active_ts: i64, p_1s: f64, rng: &mut Xor64) -> i64 {
 
 struct Sim {
     cfg: Config,
+    half_spread: f64, // strategy knob (ticks): the MM's quoted half-spread (P4 ablation subject)
     book: L2Book,
     fill_model: CalibratedFillModel,
     latency: Box<dyn LatencyModel>,
@@ -194,7 +195,7 @@ impl Sim {
             mid0
         };
         let skew = (self.position / MAX_POSITION) * SKEW_TICKS * TICK_SIZE;
-        let half = HALF_SPREAD_TICKS * TICK_SIZE;
+        let half = self.half_spread * TICK_SIZE;
         let active_ts = now + self.latency.entry_ns(now);
 
         if self.position < MAX_POSITION {
@@ -226,7 +227,7 @@ impl Sim {
     }
 }
 
-fn run(path: &str, cfg: Config, seed: u64, grid_ns: i64) -> Stats {
+fn run(path: &str, cfg: Config, seed: u64, grid_ns: i64, half_spread: f64) -> Stats {
     let reader = NpzEventReader::open(path).expect("open npz");
     let latency: Box<dyn LatencyModel> = if cfg.calibrated_latency {
         Box::new(calibrated_race_latency(seed))
@@ -235,6 +236,7 @@ fn run(path: &str, cfg: Config, seed: u64, grid_ns: i64) -> Stats {
     };
     let mut sim = Sim {
         cfg,
+        half_spread,
         book: L2Book::new(TICK_SIZE, LOT_SIZE),
         fill_model: CalibratedFillModel::new(),
         latency,
@@ -316,21 +318,16 @@ fn main() {
     let path = &args[1];
     let mut seed = 42u64;
     let mut grid_ms = 1000i64;
+    let mut half_spread = HALF_SPREAD_TICKS; // strategy knob (P4)
+    let mut csv = false; // machine-readable output for the ablation harness
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
-            "--seed" => {
-                seed = args[i + 1].parse().expect("bad seed");
-                i += 2;
-            }
-            "--grid-ms" => {
-                grid_ms = args[i + 1].parse().expect("bad grid-ms");
-                i += 2;
-            }
-            a => {
-                eprintln!("unknown arg: {a}");
-                std::process::exit(2);
-            }
+            "--seed" => { seed = args[i + 1].parse().expect("bad seed"); i += 2; }
+            "--grid-ms" => { grid_ms = args[i + 1].parse().expect("bad grid-ms"); i += 2; }
+            "--half-spread" => { half_spread = args[i + 1].parse().expect("bad half-spread"); i += 2; }
+            "--csv" => { csv = true; i += 1; }
+            a => { eprintln!("unknown arg: {a}"); std::process::exit(2); }
         }
     }
     let grid_ns = grid_ms * 1_000_000;
@@ -342,7 +339,21 @@ fn main() {
         Config { name: "+fill+latency+impact", calibrated_fill: true, calibrated_latency: true, impact: true },
     ];
 
-    println!("HFT-SimLab P2.5/P2.6 ablation backtest — {path}  (grid={grid_ms}ms, seed={seed})");
+    if csv {
+        // one row per config; header lets the P4 harness (experiments/ablation) parse it directly.
+        println!("config,half_spread,seed,fills,buys,sells,pnl,fees,end_pos,cancel");
+        for cfg in configs {
+            let s = run(path, cfg, seed, grid_ns, half_spread);
+            println!(
+                "{},{},{},{},{},{},{:.6},{:.6},{:.6},{}",
+                cfg.name, half_spread, seed, s.fills, s.buy_fills, s.sell_fills,
+                s.final_equity, s.fees, s.final_position, s.cancelled_unfilled
+            );
+        }
+        return;
+    }
+
+    println!("HFT-SimLab P2.5/P2.6 ablation backtest — {path}  (grid={grid_ms}ms, seed={seed}, half_spread={half_spread})");
     println!("PnL is quote-currency (USDT) mark-to-market: cash + position * last_mid.");
     println!(
         "{:>22} | {:>7} | {:>7} | {:>7} | {:>12} | {:>8} | {:>8} | {:>9}",
@@ -350,7 +361,7 @@ fn main() {
     );
     println!("{}", "-".repeat(96));
     for cfg in configs {
-        let s = run(path, cfg, seed, grid_ns);
+        let s = run(path, cfg, seed, grid_ns, half_spread);
         println!(
             "{:>22} | {:>7} | {:>7} | {:>7} | {:>12.4} | {:>8.4} | {:>8.4} | {:>9}",
             cfg.name, s.fills, s.buy_fills, s.sell_fills, s.final_equity, s.fees, s.final_position,
