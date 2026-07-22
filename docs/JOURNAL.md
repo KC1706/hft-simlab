@@ -1859,3 +1859,43 @@ is too short/discontinuous) — a scale gate, flagged not faked. Then: day 2 →
 ---
 *(Next entry: acquire day 2 (collector/Tardis) for the out-of-sample sim-to-real gap, or the
 +generative converter + a scaled continuous rollout.)*
+
+## Entry 17 — P4 +generative: the generated-market backtest bridge + scale ceiling (2026-07-22)
+
+Built the `+generative` bridge (docs/PHASE4_ABLATION_DESIGN.md, 5th cell) and got the first
+strategy-on-generated-market result.
+
+### What was done
+- `scripts/p37_gen_to_npz.py` — converts a generated market (p34 denorm CSV) to the exact `.npz`
+  Event stream `core/src/npz.rs` replays: diff consecutive top-10 book snapshots → DEPTH_EVENT per
+  changed level (absolute qty), executions → TRADE_EVENT; DEFLATE member `data.npy`, dtype-exact.
+  VALIDATED: the Rust backtest reads it with no dtype error and runs a strategy against the P3
+  market. So `+generative` is a **market-source swap** (backtest the same strategy on the generated
+  vs the real book), which is the honest shape of the 5th cell — not a realism toggle on one day.
+
+### The finding (short horizon, matched-structure 20×150-event markets)
+Normalized per second (generated span 7.62s, real 3.13s — generated dt spans more wall-clock):
+- **naive fills/s: generated 8.53 vs real 0.64 (~13×).** The generated book's short-horizon price
+  excursions reach the MM's ±60-tick quotes far more than real trades do → a naive backtest on the
+  generated market badly over-fills a maker. Consistent with the imbalance/dynamics gap (Entry 15).
+- **+fill fills/s: generated 0.79 vs real 0.96 — they CONVERGE.** The calibrated queue fill model
+  (P2.2) largely corrects for the differing market dynamics. Second-order result: the realism layer
+  matters *more* when the underlying market is imperfect.
+
+### The scale ceiling (honest, and itself a finding)
+The generated market is ~2.5 ms/event, so a feasible autoregressive rollout is short in wall-clock:
+3000 events ≈ 7.6 s; a ~1h GPU rollout (~24k events) ≈ ~60 s. A full-day (hours) sim-to-real PnL on
+a purely generated market would need millions of events ≈ tens of GPU-hours — infeasible with
+step-by-step diffusion sampling. So `+generative` is inherently a SHORT-horizon comparison at
+feasible cost; the finding above is a single-realization, seconds-scale signal, not a day-scale PnL.
+Making it day-scale needs a faster sampler (distillation/consistency models) or coarser-time
+generation — a real research direction, flagged not faked.
+
+### Manual test for you
+`python scripts/p37_gen_to_npz.py /tmp/gen_market.csv --out /tmp/gen.npz` then
+`core/target/release/backtest /tmp/gen.npz --csv --strategy mm --grid-ms 100` — the backtest reads
+the generated market and prints PnL; contrast naive vs +fill fill counts vs a real slice.
+
+---
+*(Next entry: day 2 of data for the out-of-sample real sim-to-real gap (collector/Tardis), and/or a
+faster sampler to lift the +generative scale ceiling.)*
