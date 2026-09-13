@@ -1,0 +1,4 @@
+Q: What's the difference between move, copy, and clone?
+- Move — ownership transfers; the original is no longer usable (default for heap types like String, Vec).
+- Copy — a cheap bitwise duplicate; the original stays valid (for small stack types like i64, f64, your Level struct which is #[derive(Copy)]).
+- Clone — an explicit, possibly expensive deep copy you call with .clone().explain this clealry
