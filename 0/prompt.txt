@@ -1,0 +1,3 @@
+Q: Difference between &T and &mut T?
+&T is a shared/immutable borrow — you can have many at once. &mut T is an exclusive/mutable borrow — you can have only one, and no shared borrows may coexist with it. This "one writer XOR many readers" rule is enforced at compile time and is what prevents data races.
+ explain this clealry
