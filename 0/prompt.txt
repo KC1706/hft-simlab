@@ -1,0 +1,5 @@
+hi could you explain the tech stack of the project
+
+---
+
+do one thing do an empty commit now
