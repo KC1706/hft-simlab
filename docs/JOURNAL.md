@@ -1899,3 +1899,199 @@ the generated market and prints PnL; contrast naive vs +fill fill counts vs a re
 ---
 *(Next entry: day 2 of data for the out-of-sample real sim-to-real gap (collector/Tardis), and/or a
 faster sampler to lift the +generative scale ceiling.)*
+
+## Entry 18 — P4.1: the learned market-maker (RL), a 3rd ablation subject (2026-10-09)
+
+The ablation's thesis — *which realism component matters depends on the strategy* — was argued so
+far with two **hand-written** robots: the fixed-offset MM (fill/latency/impact all bite) and the
+OFI taker (fill & latency are exact no-ops; only impact bites, Entry 16). This entry adds a third,
+**learned** subject so the thesis holds for a self-taught policy, not just toy rules — the version a
+reviewer can't wave away as "you rigged the strategies."
+
+### What was done
+- `experiments/rl/train_rl_mm.py` — trains a deliberately **tiny** policy: a linear softmax over 5
+  standardized features `[bias, imbalance−0.5, position/MAX, spread_z, return×scale]` → a 12-action
+  grid `(half-spread ∈ {20,40,60,80} ticks) × (skew-mult ∈ {0,1,2})`. A few dozen weights, REINFORCE
+  with a moving-average baseline, CPU-trainable in seconds, and cheap to forward-pass in Rust (no NN
+  runtime). Training env = a faithful **naive-fill** replay of Day A (same 100 ms grid + trade-through
+  fill rule as the Rust `naive` config); it caches a grid-sampled sequence (`*.rlgrid.npz`) so epochs
+  replay a few hundred-k lightweight steps, not 26 M events.
+- `core/src/bin/backtest.rs` — new `Strategy::RlMm` + a std-only `Policy` loader (weights are a plain
+  whitespace/newline `.txt` — the core keeps its *zero-deps-beyond-flate2* rule). `rl_decide()` builds
+  the identical feature vector from the live `L2Book`, argmaxes the policy, and calls the shared
+  `requote_params(half, skew)` — so the learned MM runs through the **exact same** realism toggles
+  (calibrated fill / latency-race / impact propagator) as the parametric MM. Apples-to-apples.
+- `experiments/ablation/run_ablation.py` — adds the `rl` subject to the sweep automatically when the
+  trained weights exist; `make ablation` now produces a 3-subject waterfall.
+
+### Theory 18.1 — Why a learned probe, and why REINFORCE here
+A backtest's realism is invisible until a strategy *uses* it: the strategy is the thermometer, its
+PnL the reading, and the ablation reads how much each realism component changes that PnL. Different
+strategies touch different components (a maker waits in a queue → feels the fill model; a taker
+crosses the spread → feels impact). Two hand-written probes already span the maker/taker axis; an RL
+probe adds a strategy whose quoting *adapts to state*, which is both more realistic and not chosen by
+us. REINFORCE is the right minimal tool: the reward (per-step equity increment − inventory penalty,
+Cartea *Algorithmic & HFT* on inventory-penalized MM objectives) is a return over a trajectory of
+discrete quoting actions; policy-gradient optimizes expected return directly without a value model,
+and with a tiny linear policy there's nothing to overfit. The inventory penalty is the Avellaneda–
+Stoikov idea in reward form — discourage holding directional risk, the same instinct as the MM's
+inventory skew (Entry 0/P0).
+
+### The honest shape (this is a sim-to-sim transfer, stated as such)
+The policy is TRAINED in the naive-fill env and EVALUATED frozen across all configs
+{naive,+fill,+latency,+impact}. Latency and impact are deliberately **absent from training** — if the
+policy were tuned to a particular realism toggle, the ablation would be circular (it would measure the
+policy's adaptation, not the component's effect). Training simple / evaluating in the full stack is a
+standard, defensible sim-to-sim setup; it goes in paper §4 as a method caveat, not buried.
+
+### Honesty rail — trained on Day A ONLY
+`train_rl_mm.py` takes a single `--npz` and stamps `trained_on` into the weights file. Day B
+(held-out, Tardis) is never seen in training — the Rust evaluator loads the frozen weights and runs
+them on B. Without this the out-of-sample gap would be contaminated.
+
+### Results — in-sample, Day A (2026-10-10)
+Two honest findings, one about the agent and one about the ablation.
+
+**(1) The policy did NOT learn to improve — and that is itself consistent with the thesis.** The
+REINFORCE mean-return curve is flat/slightly-declining (epoch 0 ≈ −6.4 → ~−8 by epoch 100, stochastic
+rollouts), and the greedy policy loses across every config (naive −54, +fill −41, +impact −48 USDT).
+This is *expected*: passive market-making on this BTCUSDT day loses under every realism config — the
+fixed MM loses too (−30…−41), the OFI taker loses badly (−219). Adverse selection + maker fees exceed
+the spread captured (paper §3.2's "≈ −3 bps/trade, adverse-selection-dominated"). There is no
+profitable quoting regime for a tiny linear policy to find, so REINFORCE wanders among near-equally
+losing policies. The agent is NOT a profitability result; it is a *probe*. (Two training attempts were
+made — a random-window version and this fixed-window + per-window-baseline version; the second is the
+methodologically correct one. No further hyperparameter tuning: the point is the fingerprint, below.)
+
+**(2) The RL subject IS a distinct realism fingerprint — the point of adding it.** Marginal ΔPnL of
+the `fill` (calibrated queue) component, 8 seeds, paired bootstrap 95% CI:
+| subject | fill ΔPnL | sig | reading |
+|---|---|---|---|
+| ofi-taker | **+0.000** (deterministic) | — | a taker never queues → fill model cannot apply |
+| mm(½=20, tight) | +2.16 [+1.37,+2.98] | yes | tight maker: queue model *helps* its estimate |
+| mm(½=40) | +1.93 [+0.27,+3.53] | yes | |
+| mm(½=60) | −3.22 [−4.83,−1.51] | yes | sign flips as the maker widens |
+| mm(½=80, wide) | −8.10 [−9.36,−6.82] | yes | wide maker: queue model *hurts* its estimate |
+| **rl-mm** (learned) | **+7.52 [+6.69,+8.42]** | yes | largest of all — the adaptive maker is the most fill-sensitive |
+
+So the realism component that dominates is strategy-dependent along a clean spectrum: **taker = immune
+(exactly 0), fixed maker = sign-varying with aggressiveness, learned aggressive maker = maximally
+sensitive (+7.5).** The `impact` component bites everything (mm −0 to −4, ofi −3.8, rl −3.2); `latency`
+is mostly not significant for makers and exactly 0 for the taker. The RL fingerprint is distinct
+because the policy converged to *aggressive tight quoting* (2027→3578 fills) — a learned maker, not a
+smarter one; that is the honest framing for §4.
+
+**Caveat carried to the paper:** the RL subject's value is as a learned probe anchoring the
+high-fill-sensitivity end of the spectrum, NOT as evidence a learned MM is profitable. Stated plainly,
+not spun.
+
+### Manual test for you
+1. `.venv/bin/python experiments/rl/train_rl_mm.py --npz data/btcusdt_20260501_0000_0656.npz`
+   → writes `experiments/rl/rl_mm.weights.{json,txt}`; watch the printed mean-return rise.
+2. `cargo build --release --bin backtest && core/target/release/backtest \
+   data/btcusdt_20260501_0000_0656.npz --strategy rl --grid-ms 100` → the learned MM runs the
+   ablation and prints its PnL per config.
+3. `make ablation` → the waterfall now has an `rl-mm` row next to `mm(½=…)` and `ofi-taker`.
+
+### Next
+Day B (Tardis, your download) → the out-of-sample sim-to-real gap across all three strategies = the
+paper's headline table + waterfall (§5).
+
+---
+
+## Entry 19 — P4.3: the held-out second day, and what it does (and does not) replicate (2026-10-12)
+
+The headline gate (design doc §"gating prerequisite"): the realism effects must be measured
+**out-of-sample**, or the ablation just reports overfitting. This entry acquires a genuine second
+day, runs the frozen Day-A-calibrated stack on it, and reports honestly what survives the transfer.
+
+### What was done — acquiring Day B for $0
+- **Source.** Tardis.dev serves the *first day of each month free* (no API key) at
+  `datasets.tardis.dev/v1/binance-futures/{trades,incremental_book_L2}/YYYY/MM/01/BTCUSDT.csv.gz`.
+  Day A is `2026-05-01`; Day B = `2026-06-01` — a different month, so a genuinely held-out regime
+  (BTCUSDT ≈ $73.6k on Jun 1 vs the May slice). HEAD requests 404 there; a plain GET returns the gzip.
+- **Size-matching (why the window is 4.46 h, not 6.94 h).** The June 1 full-day file is ~1.5× more
+  active than May: the same midnight→06:56 clock window gave **40.5 M events** (39.6 M book rows, a
+  3.2 GB uncompressed CSV) — which will not fit `tardis.convert` in 8 GB RAM. So Day B was sliced to
+  the timestamp of its ~26 M-th book row (midnight→**04:27:44 UTC**), yielding **27.47 M events** —
+  within 3 % of Day A's 26.66 M. Matching the *event budget* (not the wall-clock) keeps the two days
+  comparable **and** inside the RAM proven on Day A (buffer_size = 27 M). Stream-sliced with `awk`
+  from the gz so the full multi-GB CSV never hit disk; raw + sliced CSVs deleted after conversion
+  (CLAUDE.md disk rule). Converter now parameterized (`scripts/p0_convert.py --trades/--book/--out`).
+- **Honesty rails held.** Fill/latency/impact tables and the RL weights are all calibrated/trained on
+  Day A *only*; Day B is seen for the first time at evaluation. `make ablation` on Day B →
+  `experiments/ablation/results_dayB.parquet`.
+
+### Theory 19.1 — the metric collapses: `naive` IS the ground-truth proxy
+Reading the metric against the code (`backtest.rs:288,384`) surfaces a subtlety that reshapes the
+headline. The design doc defines **ground truth** `PnL_real` as the *naive-fill backtest on the real
+book* — "fill only when a real trade crosses the quote." But that is **exactly** what the `naive`
+config computes (`calibrated_fill=false` → `settle_naive_trade`, fill only on a real trade-through).
+So `PnL_sim(S, D, naive) ≡ PnL_real(S, D)` **by construction**, and `g(naive) = 0` trivially. The
+pre-registered sentence "each realism component *closes the gap* to reality" therefore cannot be
+shown with this ground truth — without L3 queue data there is no independent truth for the calibrated
+models to be *closer to*. What the ablation can honestly measure is the **magnitude and direction of
+the correction** each component applies relative to the naive-real proxy, and crucially **whether that
+correction replicates out-of-sample**. That is the reframed headline (§5): not "realism closes a gap"
+but "the naive backtest mis-estimates PnL by a large, strategy-dependent amount that the calibrated
+stack quantifies — and the *fill* correction replicates on a held-out day while its *sign* does not."
+
+### Results — held-out Day B vs in-sample Day A (fill component, 8 seeds, paired bootstrap 95% CI)
+| subject | Day A fill ΔPnL | Day B fill ΔPnL | transfers? |
+|---|---|---|---|
+| ofi-taker | **+0.000** (det.) | **+0.000** (det.) | ✓ exact — structural (a taker never queues) |
+| mm(½=20) | +2.16 [+1.37,+2.98] | **+25.72** [+24.23,+26.96] | sign ✓, magnitude ~12× |
+| mm(½=40) | +1.93 [+0.27,+3.53] | **+21.35** [+19.64,+22.80] | sign ✓ |
+| mm(½=60) | **−3.22** [−4.83,−1.51] | **+14.85** [+14.23,+15.33] | **sign FLIPS** |
+| mm(½=80) | **−8.10** [−9.36,−6.82] | **+9.05** [+8.07,+9.96] | **sign FLIPS** |
+| rl-mm | +7.52 [+6.69,+8.42] | **+23.11** [+22.42,+23.78] | sign ✓, near-largest |
+
+**What replicates (robust findings):**
+1. **Fill is the dominant realism correction** and is *significant on every maker, both days* — never
+   negligible. On Day B it is a large positive correction for *all* makers (+9 to +26 USDT on PnL
+   bases of −24 to −65, i.e. the naive backtest understates maker PnL by 15–40 %).
+2. **The taker's fill/latency immunity is exact and structural** (+0.000 both days) — the cleanest
+   cross-strategy contrast, and it transfers perfectly because it is a property of the strategy, not
+   the data.
+3. **Impact is a consistent small *negative* correction** where significant (mm20 −4.5/−4.2, rl
+   −2.9/−3.2, ofi −2.2/−3.8 on B/A) — sign and rough magnitude transfer.
+4. **Latency is mostly insignificant** on both days — a second-order component here.
+
+**What does NOT replicate (the honest negative result):**
+- Day A's clean **half-spread sign-flip** (fill helps tight makers, *hurts* wide makers: +2.16 →
+  −8.10) is a **Day-A artifact**. On Day B the fill correction is positive for *every* half-spread,
+  monotonically *decreasing* with width (+25.7 → +9.0) but never crossing zero. So the qualitative
+  claim that survives is weaker and truer: *the fill correction's **magnitude** is strategy- and
+  regime-dependent (largest for tight/adaptive makers, smallest for wide), its **sign** is not stable
+  across days for wide makers, and it is **exactly zero** for takers.* The sign-flip must be demoted
+  from "finding" to "day-A-specific observation" in the paper — catching this is exactly why the
+  held-out day was a hard gate.
+
+### Theory 19.2 — why fill dominates and why the magnitude jumps on Day B
+The fill correction is the difference between (a) filling only when a real trade prints through your
+level and (b) the calibrated P(fill | queue position) model, which also fills you *probabilistically
+while you sit in the queue*. For a maker this almost always means **more fills at your quoted
+(favorable) price** → less-negative PnL (Bouchaud *TQP* ch. 6 on queue dynamics; the isotonic fill
+model, arXiv 2403.02572, Entry 7). June 1 was more trade-intense per unit book depth, so the queue
+model's incremental fills are larger and more favorable → the +9…+26 jump vs May's +2…−8. The taker
+is immune because it crosses the spread and fills at the touch regardless of queue (`backtest.rs:55`),
+so no queue model can move it — only impact (its own trades pushing price) bites, and it does, both
+days. This is the paper's spine: **the realism component that matters is a property of how the
+strategy interacts with the book, and only the structural parts of that interaction transfer across
+days.**
+
+### Manual test for you
+1. Day B is already built: `ls -la data/btcusdt_20260601_dayB.npz` (27.47 M events, Jun 1 00:00–04:28 UTC).
+2. Re-run the held-out ablation:
+   `.venv/bin/python experiments/ablation/run_ablation.py --npz data/btcusdt_20260601_dayB.npz --seeds 8 --out experiments/ablation/results_dayB.parquet`
+   → compare its fill column to Day A's; confirm the taker rows are exactly 0 and the mm(½=60/80)
+   fill effects are now *positive* (the sign-flip does not transfer).
+
+### Next
+Decide the §5 headline framing (correction-magnitude + replication, per Theory 19.1) and write it up;
+demote the sign-flip; fill the abstract number (candidate: "the fill model alone moves backtested
+maker PnL by 15–40 %, significant and directionally-stable-in-magnitude out-of-sample"). Then figures
+([FIG-9] waterfall, Day A ∥ Day B) and the PDF.
+
+---
+*(Next entry: §5 write-up + figures once the framing is chosen with the user.)*

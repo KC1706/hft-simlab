@@ -279,14 +279,128 @@ PnL-prediction error attributable to each component. [Headline number goes here.
 *All figure content, axes, captions, and the raw data each phase must log are fully specified
 in `paper/FIGURES.md` — figures are designed before the data exists.*
 
-## 4. Experimental Design ◻ — *written during Phase 4 setup, BEFORE results* — [FIG-8]
-- Strategies under test; symbols/days; calibration vs held-out split protocol;
-  ablation grid; error metric (PnL-gap distribution vs real replay); significance testing.
+## 4. Experimental Design ◑ — *written during Phase 4 setup, BEFORE results* — [FIG-8]
+
+**Strategies under test (the probes).** A backtest's realism is only observable through a strategy
+that uses it: the strategy is the instrument and its PnL the reading. We deliberately test strategies
+that stress *different* parts of the stack, because a realism component that dominates one strategy's
+error can be irrelevant to another — and that contrast is itself a result, not noise. Three subjects:
+1. **Fixed-offset market maker (MM)** — quotes ±k ticks around mid with inventory skew (k ∈
+   {20,40,60,80} ticks as strategy variants). A *maker*: it rests in the queue, so it is sensitive to
+   the fill-probability model, to latency, and to impact.
+2. **OFI-momentum taker** — crosses the spread toward top-of-book order-flow imbalance past a
+   threshold. A *taker*: it fills at the touch with certainty, so the queue/fill and latency-race
+   models are **structurally inapplicable** to it; only impact bites. It is the maker's opposite.
+3. **Learned market maker (RL-MM)** — a small policy (linear softmax over standardized features:
+   book imbalance, inventory, spread, short-horizon return) selecting a half-spread/skew action each
+   decision step, trained by REINFORCE with an inventory-penalized reward. It is a *learned*, state-
+   adaptive probe: the finding must not depend on hand-picked parametric rules, so a policy chosen by
+   optimization rather than by the authors is the harder-to-dismiss third subject.
+
+   *Method caveat (stated, not buried):* the RL policy is trained once, under the **naive-fill**
+   configuration, and then evaluated **frozen** across every ablation configuration. Latency and
+   impact are intentionally excluded from training so the policy is not tuned to a particular realism
+   toggle — otherwise the ablation would measure the policy's adaptation rather than the component's
+   effect. Training in the simplest configuration and evaluating in the full stack is a standard
+   sim-to-sim transfer; we report it as such. The policy is trained on the calibration day only; the
+   held-out day is never seen during training.
+
+**Symbols / days.** Calibrate every component on day A; evaluate on a held-out day B (both free
+Tardis.dev first-of-month BTCUSDT L2+trades). The split is the point: an in-sample gap measures
+overfitting, not fidelity.
+
+**Ablation grid.** Each strategy × each simulator configuration
+`{naive → +fill → +fill+latency → +fill+latency+impact}` × seeds (the calibrated fill and latency
+models are stochastic; seeds give a PnL distribution, not a point).
+
+**Error metric.** Ground truth is the naive-fill backtest on the *real* replayed book of day B — a
+documented proxy, since crypto L2 lacks true order-ID queue positions. The per-configuration gap is
+`g(S,D,cfg) = |PnL_sim − PnL_real|`; we keep the full signed-error distribution over seeds, not just
+the mean.
+
+> **Pre-registration amendment (recorded on first running the experiment).** The ground-truth proxy
+> above — "naive-fill on the real book" — is, in our implementation, *identically* the `naive`
+> ablation configuration (both fill an order only when a real trade prints through its level).
+> Hence `PnL_sim(naive) ≡ PnL_real` and `g(naive) = 0` by construction, and a "marginal gap
+> reduction as components switch on" is not well-defined against this baseline: without level-3
+> queue data there is no truth independent of the naive proxy for the calibrated models to be
+> *closer to*. We therefore report the quantity the design can honestly measure — the **signed
+> correction** each realism component applies to the naive-real baseline, its statistical
+> significance, and, decisively, **whether that correction replicates on the held-out day**. "Does
+> adding realism change the backtested PnL, by how much, for which strategies, and does it transfer
+> across days?" replaces "does realism close a gap?". §5 reports this.
+
+**Significance.** Paired (per-seed) bootstrap confidence intervals on each component's marginal
+effect; a component "matters" when its CI excludes zero. Deterministic effects (e.g. the taker's
+exactly-zero fill/latency sensitivity) collapse to a point, which is the honest report there.
+
 - *(Pre-registering the design in this section before running experiments is what makes the
   results credible — and is good scientific hygiene reviewers reward.)*
 
-## 5. Results ◻ — *Phase 4* — [FIG-9] waterfall + [TAB-1] ablation table
-- The ablation table (the paper's centerpiece) + per-component marginal fidelity gains.
+## 5. Results ◐ — *Phase 4* — [FIG-9] waterfall + [TAB-1] ablation table
+
+We calibrate every component on day A (`2026-05-01`) and evaluate the frozen stack on a held-out day
+B (`2026-06-01`), both BTCUSDT; the days are matched by event budget (≈26–27 M events) rather than
+wall-clock, since day B is ≈1.5× more active per unit depth (§4, day B is a 4.46 h window). All
+strategies lose money net of adverse selection and maker fees on both days (passive making is
+unprofitable on this instrument — a property of the data, not a result we claim), so we read the
+ablation through the *correction* each component applies, not through profitability.
+
+**[TAB-1] Marginal effect of each realism component on backtested PnL (USDT), paired per-seed
+bootstrap 95% CI, 8 seeds; "sig" = CI excludes zero.** The *fill* column is the headline.
+
+| subject | fill ΔPnL (day A) | fill ΔPnL (day B, held-out) | impact ΔPnL (A / B) | latency ΔPnL (A / B) |
+|---|---|---|---|---|
+| OFI-taker | **+0.00** det. | **+0.00** det. | −3.80 / −2.16 (sig both) | 0.00 / 0.00 |
+| MM(½=20) | +2.16 [1.37,2.98] sig | **+25.72** [24.23,26.96] sig | −4.21 / −4.50 (sig both) | +0.87 / +1.15 (ns) |
+| MM(½=40) | +1.93 [0.27,3.53] sig | **+21.35** [19.64,22.80] sig | −1.04 / −1.20 (ns both) | +0.36 / −0.07 (ns) |
+| MM(½=60) | **−3.22** [−4.83,−1.51] sig | **+14.85** [14.23,15.33] sig | −1.62 / +0.07 | +1.34 / −1.80 |
+| MM(½=80) | **−8.10** [−9.36,−6.82] sig | **+9.05** [8.07,9.96] sig | −0.01 / −0.79 (ns) | +1.12 / −0.25 |
+| RL-MM (learned) | +7.52 [6.69,8.42] sig | **+23.11** [22.42,23.78] sig | −3.19 / −2.91 (sig both) | +0.51 / −1.30 (ns) |
+
+Three findings, separated by how well they survive the held-out day.
+
+**(i) The fill/queue model is the dominant correction, and its significance transfers; its magnitude
+is large and regime-dependent.** For every maker, on both days, switching the naive trade-through
+rule to the calibrated P(fill | queue) model is a statistically significant PnL correction — never
+negligible. On day B it is a *large positive* correction for every maker (+9 to +26 USDT against
+naive PnL bases of −24 to −65), i.e. the naive backtest **understates** maker PnL by 15–40 %. The
+economic reading (§3.2, Bouchaud TQP ch. 6): the queue model fills resting orders probabilistically
+while they wait, not only on a full trade-through, yielding more fills at the maker's favorable
+quoted price. The magnitude scales with how much a strategy rests in the queue — largest for the
+tight fixed maker and the learned maker, smallest for the widest maker.
+
+**(ii) The taker's structural immunity is exact and transfers perfectly.** The OFI-taker's fill and
+latency corrections are *identically zero* on both days: a strategy that crosses the spread fills at
+the touch regardless of queue position, so neither the queue model nor the latency race can move it;
+only its own market impact bites (−3.80 day A, −2.16 day B, significant both). This is the sharpest
+cross-strategy contrast in the paper and it transfers exactly, because it is a property of the
+strategy's interaction with the book, not of the day.
+
+**(iii) The *sign* of the fill correction for wide makers does *not* transfer — an honest negative
+result.** On day A the fill correction flipped sign with maker width (helping tight makers, +2.16,
+but *hurting* wide makers, −8.10). On day B it is positive for *every* width, decreasing
+monotonically (+25.72 → +9.05) but never crossing zero. The clean day-A sign-flip is therefore a
+day-specific artifact, not a robust finding; we demote it accordingly. What survives is the weaker,
+truer statement: the fill correction's **magnitude** is strategy- and regime-dependent (largest for
+tight/adaptive makers, smallest for wide ones), it is **exactly zero** for takers, and its **sign**
+for wide makers is not stable across days. Catching this is precisely what the held-out day is for.
+
+*Impact* is a consistent small negative correction wherever significant (taker −2 to −4; tight and
+learned makers −3 to −4.5) and transfers in sign and rough magnitude. *Latency* is second-order:
+rarely significant on either day. The learned RL-MM behaves as a tight, aggressive maker — it anchors
+the high-fill-sensitivity end of the spectrum (+7.52 day A, +23.11 day B) and tracks the tight fixed
+maker, confirming the fingerprint is a property of the quoting behavior the policy learned, not of
+hand-chosen parameters. It is a *probe*, not a profitability result (§4 caveat).
+
+> **[FIG-9]** waterfall: PnL vs config `{naive→+fill→+fill+latency→+fill+latency+impact}`, one panel
+> per strategy, day A and day B overlaid, seed-dispersion bands — to be rendered from
+> `experiments/ablation/results.parquet` (day A) and `results_dayB.parquet` (day B).
+
+*Headline sentence (candidate, wording TBD): the fill-model correction alone moves backtested
+market-maker PnL by 15–40 %, is significant for every maker on a held-out day, and is exactly zero
+for takers — so a backtest's realism budget should be spent where the strategy actually interacts
+with the book.*
 
 ## 6. Limitations & Conclusion ◻
 - Crypto-L2-only validation; single-venue; inference-based fill ground truth — be loud about

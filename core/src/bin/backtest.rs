@@ -62,6 +62,60 @@ const OFI_THRESHOLD: f64 = 0.15; // take when |imbalance − 0.5| exceeds this
 enum Strategy {
     Mm,       // fixed-offset skewed market maker (the P0/P2 subject)
     OfiTaker, // order-flow-imbalance momentum taker
+    RlMm,     // learned market maker: a tiny policy picks (half-spread, skew) each grid step (P4.1)
+}
+
+const RL_SKEW_TICKS_BASE: f64 = 10.0; // must match SKEW_TICKS_BASE in experiments/rl/train_rl_mm.py
+
+/// The tiny linear-softmax policy trained by `experiments/rl/train_rl_mm.py` and loaded here so the
+/// learned strategy runs through the SAME realism stack as MM/OFI (the ablation stays comparable).
+/// Features (must match the trainer exactly): [bias, imbalance-0.5, position/MAX, spread_z, ret*scale].
+/// Decision is deterministic at eval (argmax); the policy only TRAINED stochastically. Zero extra
+/// deps: the weights are a plain whitespace/newline text file (see trainer's `.txt` export).
+struct Policy {
+    n_features: usize,
+    n_actions: usize,
+    spread_mu: f64,
+    spread_sd: f64,
+    ret_scale: f64,
+    actions: Vec<(f64, f64)>, // (half_spread_ticks, skew_mult)
+    w: Vec<Vec<f64>>,         // n_actions x n_features
+}
+
+impl Policy {
+    fn load(path: &str) -> Policy {
+        let text = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("cannot read RL weights {path}: {e} — train them first: \
+                .venv/bin/python experiments/rl/train_rl_mm.py --npz <dayA.npz>"));
+        let mut toks = text.split_whitespace();
+        let tag = toks.next().expect("empty weights file");
+        assert_eq!(tag, "rl_mm_v1", "unexpected RL weights schema: {tag}");
+        let mut next_f = || toks.next().expect("truncated weights file").parse::<f64>().unwrap();
+        let n_features = next_f() as usize;
+        let n_actions = next_f() as usize;
+        let spread_mu = next_f();
+        let spread_sd = next_f();
+        let ret_scale = next_f();
+        let actions: Vec<(f64, f64)> = (0..n_actions).map(|_| (next_f(), next_f())).collect();
+        let w: Vec<Vec<f64>> = (0..n_actions)
+            .map(|_| (0..n_features).map(|_| next_f()).collect())
+            .collect();
+        Policy { n_features, n_actions, spread_mu, spread_sd, ret_scale, actions, w }
+    }
+
+    /// Argmax action for a feature vector. Softmax's argmax == logits' argmax, so skip the exp.
+    fn act(&self, f: &[f64]) -> (f64, f64) {
+        debug_assert_eq!(f.len(), self.n_features);
+        let (mut best, mut best_logit) = (0usize, f64::NEG_INFINITY);
+        for a in 0..self.n_actions {
+            let logit: f64 = self.w[a].iter().zip(f).map(|(wi, fi)| wi * fi).sum();
+            if logit > best_logit {
+                best_logit = logit;
+                best = a;
+            }
+        }
+        self.actions[best]
+    }
 }
 
 /// One resting virtual order. `fill_time` is the scheduled calibrated fill instant
@@ -135,6 +189,8 @@ struct Sim {
     bid: Option<Order>,
     ask: Option<Order>,
     stats: Stats,
+    policy: Option<Policy>, // Some only for Strategy::RlMm
+    rl_prev_mid: f64,       // previous grid-step mid, for the RL return feature (NaN until first)
 }
 
 impl Sim {
@@ -244,8 +300,48 @@ impl Sim {
         }
     }
 
-    /// Cancel-replace both quotes from the strategy at decision time `now`.
+    /// RL-MM decision: build the (trainer-matched) feature vector from the book, pick
+    /// (half-spread, skew-mult) with the frozen policy, then requote with those. The realism
+    /// toggles (fill/latency/impact) are untouched — identical machinery to the parametric MM.
+    fn rl_decide(&mut self, now: i64) {
+        let Some(mid) = self.book.mid() else { return };
+        let (bb, ba) = match (self.book.best_bid(), self.book.best_ask()) {
+            (Some(b), Some(a)) => (b.px, a.px),
+            _ => return,
+        };
+        let bids = self.book.top_n(Side::Bid, OFI_LEVELS);
+        let asks = self.book.top_n(Side::Ask, OFI_LEVELS);
+        let bvol: f64 = bids.iter().map(|l| l.qty).sum();
+        let avol: f64 = asks.iter().map(|l| l.qty).sum();
+        let imb = if bvol + avol > 0.0 { bvol / (bvol + avol) } else { 0.5 };
+        let p = self.policy.as_ref().expect("RlMm without a loaded policy");
+        let spread_ticks = (ba - bb) / TICK_SIZE;
+        let spread_z = (spread_ticks - p.spread_mu) / p.spread_sd;
+        let ret = if self.rl_prev_mid.is_finite() && self.rl_prev_mid != 0.0 {
+            (mid - self.rl_prev_mid) / self.rl_prev_mid
+        } else {
+            0.0
+        };
+        let f = [
+            1.0,
+            imb - 0.5,
+            self.position / MAX_POSITION,
+            spread_z,
+            ret * p.ret_scale,
+        ];
+        let (half_ticks, skew_mult) = p.act(&f);
+        self.rl_prev_mid = mid;
+        self.requote_params(now, half_ticks, skew_mult * RL_SKEW_TICKS_BASE);
+    }
+
+    /// Cancel-replace both quotes at decision time `now` with the fixed strategy constants.
     fn requote(&mut self, now: i64) {
+        self.requote_params(now, self.half_spread, SKEW_TICKS);
+    }
+
+    /// Cancel-replace both quotes with a caller-chosen half-spread and inventory-skew scale
+    /// (both in ticks). The MM passes its constants; the RL policy passes its per-step choice.
+    fn requote_params(&mut self, now: i64, half_spread_ticks: f64, skew_ticks: f64) {
         if self.bid.take().is_some() {
             self.stats.cancelled_unfilled += 1;
         }
@@ -258,8 +354,8 @@ impl Sim {
         } else {
             mid0
         };
-        let skew = (self.position / MAX_POSITION) * SKEW_TICKS * TICK_SIZE;
-        let half = self.half_spread * TICK_SIZE;
+        let skew = (self.position / MAX_POSITION) * skew_ticks * TICK_SIZE;
+        let half = half_spread_ticks * TICK_SIZE;
         let active_ts = now + self.latency.entry_ns(now);
 
         if self.position < MAX_POSITION {
@@ -291,8 +387,10 @@ impl Sim {
     }
 }
 
-fn run(path: &str, cfg: Config, seed: u64, grid_ns: i64, half_spread: f64, strategy: Strategy) -> Stats {
+fn run(path: &str, cfg: Config, seed: u64, grid_ns: i64, half_spread: f64, strategy: Strategy,
+       rl_weights: &str) -> Stats {
     let reader = NpzEventReader::open(path).expect("open npz");
+    let policy = if strategy == Strategy::RlMm { Some(Policy::load(rl_weights)) } else { None };
     let latency: Box<dyn LatencyModel> = if cfg.calibrated_latency {
         Box::new(calibrated_race_latency(seed))
     } else {
@@ -312,6 +410,8 @@ fn run(path: &str, cfg: Config, seed: u64, grid_ns: i64, half_spread: f64, strat
         bid: None,
         ask: None,
         stats: Stats::default(),
+        policy,
+        rl_prev_mid: f64::NAN,
     };
 
     let mut next_grid = i64::MIN;
@@ -338,6 +438,7 @@ fn run(path: &str, cfg: Config, seed: u64, grid_ns: i64, half_spread: f64, strat
             match sim.strategy {
                 Strategy::Mm => sim.requote(next_grid),
                 Strategy::OfiTaker => sim.ofi_decide(next_grid),
+                Strategy::RlMm => sim.rl_decide(next_grid),
             }
             next_grid += grid_ns;
         }
@@ -390,19 +491,26 @@ fn main() {
     let mut csv = false; // machine-readable output for the ablation harness
     let mut strategy = Strategy::Mm;
     let mut strat_name = "mm";
+    let mut rl_weights = "experiments/rl/rl_mm.weights.txt".to_string();
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
             "--seed" => { seed = args[i + 1].parse().expect("bad seed"); i += 2; }
             "--grid-ms" => { grid_ms = args[i + 1].parse().expect("bad grid-ms"); i += 2; }
             "--half-spread" => { half_spread = args[i + 1].parse().expect("bad half-spread"); i += 2; }
+            "--rl-weights" => { rl_weights = args[i + 1].clone(); i += 2; }
             "--strategy" => {
                 strat_name = match args[i + 1].as_str() {
                     "mm" => "mm",
                     "ofi" => "ofi",
-                    s => { eprintln!("unknown strategy: {s} (use mm|ofi)"); std::process::exit(2); }
+                    "rl" => "rl",
+                    s => { eprintln!("unknown strategy: {s} (use mm|ofi|rl)"); std::process::exit(2); }
                 };
-                strategy = if strat_name == "ofi" { Strategy::OfiTaker } else { Strategy::Mm };
+                strategy = match strat_name {
+                    "ofi" => Strategy::OfiTaker,
+                    "rl" => Strategy::RlMm,
+                    _ => Strategy::Mm,
+                };
                 i += 2;
             }
             "--csv" => { csv = true; i += 1; }
@@ -422,7 +530,7 @@ fn main() {
         // one row per config; header lets the P4 harness (experiments/ablation) parse it directly.
         println!("strategy,config,half_spread,seed,fills,buys,sells,pnl,fees,end_pos,cancel");
         for cfg in configs {
-            let s = run(path, cfg, seed, grid_ns, half_spread, strategy);
+            let s = run(path, cfg, seed, grid_ns, half_spread, strategy, &rl_weights);
             println!(
                 "{},{},{},{},{},{},{},{:.6},{:.6},{:.6},{}",
                 strat_name, cfg.name, half_spread, seed, s.fills, s.buy_fills, s.sell_fills,
@@ -440,7 +548,7 @@ fn main() {
     );
     println!("{}", "-".repeat(96));
     for cfg in configs {
-        let s = run(path, cfg, seed, grid_ns, half_spread, strategy);
+        let s = run(path, cfg, seed, grid_ns, half_spread, strategy, &rl_weights);
         println!(
             "{:>22} | {:>7} | {:>7} | {:>7} | {:>12.4} | {:>8.4} | {:>8.4} | {:>9}",
             cfg.name, s.fills, s.buy_fills, s.sell_fills, s.final_equity, s.fees, s.final_position,

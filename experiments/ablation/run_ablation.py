@@ -41,12 +41,12 @@ def bootstrap_ci(diffs, B=10000, level=95, seed=0):
     return d.mean(), float(np.percentile(means, lo)), float(np.percentile(means, hi))
 
 
-def one_run(npz, strategy, half_spread, seed):
-    out = subprocess.run(
-        [str(BIN), npz, "--csv", "--strategy", strategy,
-         "--half-spread", str(half_spread), "--seed", str(seed)],
-        capture_output=True, text=True, check=True,
-    ).stdout
+def one_run(npz, strategy, half_spread, seed, rl_weights):
+    cmd = [str(BIN), npz, "--csv", "--strategy", strategy,
+           "--half-spread", str(half_spread), "--seed", str(seed)]
+    if strategy == "rl":
+        cmd += ["--rl-weights", rl_weights]
+    out = subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
     return pl.read_csv(io.StringIO(out))
 
 
@@ -56,18 +56,27 @@ def main():
     ap.add_argument("--half-spreads", default="20,40,60,80", help="MM strategy variants (ticks)")
     ap.add_argument("--seeds", type=int, default=16, help="seeds per cell (PnL dispersion)")
     ap.add_argument("--out", default="experiments/ablation/results.parquet")
+    ap.add_argument("--rl-weights", default="experiments/rl/rl_mm.weights.txt",
+                    help="trained RL-MM policy; the rl subject is added only if this file exists")
     args = ap.parse_args()
 
     if not BIN.exists():
         raise SystemExit(f"{BIN} not found — build it: (cd core && cargo build --release --bin backtest)")
 
-    # subjects: MM at several half-spreads + the OFI taker (half_spread nominal; taker ignores it).
+    # subjects: MM at several half-spreads + the OFI taker (half_spread nominal; taker ignores it)
+    # + the learned RL-MM (P4.1) when its trained weights exist (half_spread nominal; the policy
+    # picks its own per-step half-spread). The RL subject is the 3rd, harder-to-dismiss probe.
     mm_hs = [float(x) for x in args.half_spreads.split(",")]
     subjects = [("mm", hs) for hs in mm_hs] + [("ofi", 60.0)]
+    if Path(args.rl_weights).exists():
+        subjects.append(("rl", 60.0))
+    else:
+        print(f"[ablation] NOTE: {args.rl_weights} not found — skipping the RL-MM subject. "
+              f"Train it: .venv/bin/python experiments/rl/train_rl_mm.py --npz {args.npz}")
     frames = []
     for strat, hs in subjects:
         for seed in range(1, args.seeds + 1):
-            frames.append(one_run(args.npz, strat, hs, seed))
+            frames.append(one_run(args.npz, strat, hs, seed, args.rl_weights))
     df = pl.concat(frames)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     df.write_parquet(args.out)
@@ -82,7 +91,7 @@ def main():
     print(f"{'subject':>13} | {'config':>22} | {'PnL mean':>10} | {'PnL std':>8} | {'Δ vs prev':>9} | {'fills':>7}")
     print("-" * 90)
     for strat, hs in subjects:
-        label = f"ofi-taker" if strat == "ofi" else f"mm(½={hs:.0f})"
+        label = {"ofi": "ofi-taker", "rl": "rl-mm"}.get(strat, f"mm(½={hs:.0f})")
         prev = None
         for cfg in CONFIG_ORDER:
             row = agg.filter((pl.col("strategy") == strat) & (pl.col("half_spread") == hs)
@@ -103,7 +112,7 @@ def main():
     print("-" * 66)
     transitions = [(a, b, b.split("+")[-1]) for a, b in zip(CONFIG_ORDER, CONFIG_ORDER[1:])]
     for strat, hs in subjects:
-        label = "ofi-taker" if strat == "ofi" else f"mm(½={hs:.0f})"
+        label = {"ofi": "ofi-taker", "rl": "rl-mm"}.get(strat, f"mm(½={hs:.0f})")
         sel = (pl.col("strategy") == strat) & (pl.col("half_spread") == hs)
         for a, b, comp in transitions:
             pa = df.filter(sel & (pl.col("config") == a)).sort("seed")["pnl"].to_numpy()
